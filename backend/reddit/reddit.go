@@ -55,7 +55,7 @@ type Fs struct {
 	root        string
 	features    *fs.Features   // optional features
 	opt         Options        // options for this backend
-	//ci          *fs.ConfigInfo // global config
+	ci          *fs.ConfigInfo // global config
 	//endpoint    *url.URL
 	//endpointURL string // endpoint as a string
 	srv         *rest.Client
@@ -174,9 +174,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	
 	client := fshttp.NewClient(ctx)
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:        name,
 		root:        root,
+		ci:          ci,
 		httpClient:  client,
 		srv:         rest.NewClient(client).SetRoot(rootURL),
 		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
@@ -294,6 +296,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	var (
 		entriesMu sync.Mutex // to protect entries
+		wg        sync.WaitGroup
+		checkers  = f.ci.Checkers
+		in        = make(chan api.Item, checkers)
 	)
 	
 	add := func(entry fs.DirEntry) {
@@ -301,27 +306,36 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		entries = append(entries, entry)
 		entriesMu.Unlock()
 	}
+	for i := 0; i < checkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for remote := range in {
+				u, _ := url.Parse(remote.Url)
+				file := &Object{
+					remote:    strings.Trim(u.Path, "/"),
+					fs:        f,
+					id:        remote.Id,
+					remoteUrl: remote.Url,
+				}
+				switch err := file.stat(ctx); err {
+				case nil:
+					add(file)
+				default:
+					fs.Debugf(remote, "skipping because of error: %v", err)
+				}
+			}
+		}()
+	}
 	
 	for _, e := range data.Data {
 		if e.PostHint != "image" {
 			continue
 		}
-		u, err := url.Parse(e.Url)
-		if (err != nil) {
-			continue
-		}
-		
-		file := &Object{
-			remote:    strings.Trim(u.Path, "/"),
-			fs:        f,
-			id:        e.Id,
-			remoteUrl: e.Url,
-		}
-		err = file.stat(ctx)
-		if err == nil {
-			add(file)
-		}
+		in <- e
 	}
+	close(in)
+	wg.Wait()	
 	return entries, nil
 }
 

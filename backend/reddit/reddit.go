@@ -391,7 +391,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	for _, e := range data.Data {
 		fmt.Printf("%+v\n", e)
 		if e.Domain == "i.redd.it" || e.Domain == "i.imgur.com" {
-			in <- e
+			id := e.Preview.Images[0].ID
+			_, ok := f.cache[id]
+			if !ok {
+				f.cache[id] = ""
+				in <- e
+			}
 		}
 		if e.Domain == "redgifs.com" || e.Domain ==  "gfycat.com" {
 			u, _ := url.Parse(e.Url)

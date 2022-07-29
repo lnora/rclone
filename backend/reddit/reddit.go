@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -44,7 +45,7 @@ func init() {
 		MetadataInfo: &fs.MetadataInfo{
 			System: map[string]fs.MetadataHelp{
 				"author": {
-					Type: "string",
+					Type:     "string",
 					ReadOnly: true,
 				},
 			},
@@ -274,24 +275,23 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-
 func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 	type GfyCat struct {
 		GfyItem struct {
-			Mp4URL             string        `json:"mp4Url"`
+			Mp4URL string `json:"mp4Url"`
 		} `json:"gfyItem"`
 	}
 
 	var (
 		gfycat GfyCat
-		resp *http.Response
-		err error
+		resp   *http.Response
+		err    error
 	)
 
 	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/v1/gfycats/"+name,
-		RootURL:    "https://api.redgifs.com",
+		Method:  "GET",
+		Path:    "/v1/gfycats/" + name,
+		RootURL: "https://api.redgifs.com",
 	}
 
 	err = f.pacer.Call(func() (bool, error) {
@@ -306,34 +306,23 @@ func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 	return gfycat.GfyItem.Mp4URL
 }
 
-// List the objects and directories in dir into entries.  The
-// entries can be returned in any order but should be for a
-// complete directory.
-//
-// dir should be "" to list the root, and should not have
-// trailing slashes.
-//
-// This should return ErrDirNotFound if the directory isn't
-// found.
-func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+func getPushshift(f *Fs, ctx context.Context, subreddit, author string, before int64) (items []api.Item, err error) {
+	defer log.Trace(f, "subreddit=%v,author=%v,before=%v", subreddit, author, before)
 	var (
 		data *api.ListItems
 		resp *http.Response
 	)
 
-	if err != nil {
-		return nil, err
-	}
-
 	values := url.Values{}
-	if f.opt.Subreddit != "" {		
-		values.Set("subreddit", f.opt.Subreddit)
+	if subreddit != "" {
+		values.Set("subreddit", subreddit)
 	}
-	if f.opt.Author != "" {
-		values.Set("author", f.opt.Author)
+	if author != "" {
+		values.Set("author", author)
 	}
 	values.Set("size", "100")
 	values.Set("sort", "desc")
+	values.Set("before", strconv.FormatInt(before, 10))
 
 	opts := rest.Opts{
 		Method:     "GET",
@@ -348,6 +337,35 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if err != nil {
 		fmt.Printf("...Error %v\n", err)
 		return nil, err
+	}
+	return data.Data, nil
+}
+
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	var (
+		data      []api.Item
+		oldBefore int64
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	
+	lastBefore := time.Now().AddDate(0, -1, 0).Unix()
+	for before := time.Now().Unix(); (before >= lastBefore) && (oldBefore != before); before = data[len(data)-1].CreatedUtc {
+		oldBefore = before
+		data2, _ := getPushshift(f, ctx, f.opt.Subreddit, f.opt.Author, before)
+		data = append(data, data2...)
 	}
 
 	var (
@@ -388,8 +406,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}()
 	}
 
-	for _, e := range data.Data {
-		fmt.Printf("%+v\n", e)
+	for _, e := range data {
 		if e.Domain == "i.redd.it" || e.Domain == "i.imgur.com" {
 			id := e.Preview.Images[0].ID
 			_, ok := f.cache[id]
@@ -398,15 +415,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				in <- e
 			}
 		}
-		if e.Domain == "redgifs.com" || e.Domain ==  "gfycat.com" {
+		if e.Domain == "redgifs.com" || e.Domain == "gfycat.com" {
 			u, _ := url.Parse(e.Url)
 			v := path.Base(u.Path)
-			_, ok := f.cache[v] 
+			_, ok := f.cache[v]
 			if !ok {
 				e.Url = getGfyCat(f, ctx, v)
-				fmt.Printf("%v\n", e.Url)
 				f.cache[v] = ""
-				in <- e				
+				in <- e
 			}
 		}
 	}

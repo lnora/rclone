@@ -11,6 +11,7 @@ type Item struct {
 	Author     string `json:"author"`
 	CreatedUtc int64  `json:"created_utc"`
 	Id         string `json:"id"`
+	Domain     string `json:"domain"`
 	PostHint   string `json:"post_hint"`
 	Url        string `json:"url"`
 }

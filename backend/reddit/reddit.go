@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ const (
 	minSleep      = 1 * time.Second
 	maxSleep      = 5 * time.Second
 	decayConstant = 1
-	rootURL       = "https://api.pushshift.io" 
+	rootURL       = "https://api.pushshift.io"
 )
 
 var (
@@ -37,30 +38,41 @@ var (
 
 func init() {
 	fsi := &fs.RegInfo{
-		Name:        "reddit",
-		NewFs:       NewFs,
+		Name:  "reddit",
+		NewFs: NewFs,
+
+		MetadataInfo: &fs.MetadataInfo{
+			System: map[string]fs.MetadataHelp{
+				"author": {
+					Type: "string",
+					ReadOnly: true,
+				},
+			},
+		},
 	}
 	fs.Register(fsi)
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	Subreddit string          `config:"subreddit"`
-	NoHead    bool            `config:"no_head"`
+	Subreddit string `config:"subreddit"`
+	Author    string `config:"author"`
+	NoHead    bool   `config:"no_head"`
 }
 
 // Fs stores the interface to the remote HTTP files
 type Fs struct {
-	name        string
-	root        string
-	features    *fs.Features   // optional features
-	opt         Options        // options for this backend
-	ci          *fs.ConfigInfo // global config
+	name     string
+	root     string
+	features *fs.Features   // optional features
+	opt      Options        // options for this backend
+	ci       *fs.ConfigInfo // global config
 	//endpoint    *url.URL
 	//endpointURL string // endpoint as a string
-	srv         *rest.Client
-	pacer       *fs.Pacer
-	httpClient  *http.Client
+	srv        *rest.Client
+	pacer      *fs.Pacer
+	cache      map[string]string
+	httpClient *http.Client
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -70,8 +82,9 @@ type Object struct {
 	size        int64
 	modTime     time.Time
 	contentType string
-	id          string    // ID of the object
+	id          string // ID of the object
 	remoteUrl   string
+	etag        string
 }
 
 // statusError returns an error if the res contained an error
@@ -171,17 +184,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
-	
+
 	client := fshttp.NewClient(ctx)
 
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
-		name:        name,
-		root:        root,
-		ci:          ci,
-		httpClient:  client,
-		srv:         rest.NewClient(client).SetRoot(rootURL),
-		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:       name,
+		root:       root,
+		ci:         ci,
+		opt:        *opt,
+		httpClient: client,
+		srv:        rest.NewClient(client).SetRoot(rootURL),
+		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		cache:      map[string]string{},
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -259,6 +274,38 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
+
+func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
+	type GfyCat struct {
+		GfyItem struct {
+			Mp4URL             string        `json:"mp4Url"`
+		} `json:"gfyItem"`
+	}
+
+	var (
+		gfycat GfyCat
+		resp *http.Response
+		err error
+	)
+
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/v1/gfycats/"+name,
+		RootURL:    "https://api.redgifs.com",
+	}
+
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &gfycat)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		fmt.Printf("%+v\n", err)
+		return ""
+	}
+	return gfycat.GfyItem.Mp4URL
+}
+
 // List the objects and directories in dir into entries.  The
 // entries can be returned in any order but should be for a
 // complete directory.
@@ -274,8 +321,17 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		resp *http.Response
 	)
 
+	if err != nil {
+		return nil, err
+	}
+
 	values := url.Values{}
-	values.Set("subreddit", f.opt.Subreddit)
+	if f.opt.Subreddit != "" {		
+		values.Set("subreddit", f.opt.Subreddit)
+	}
+	if f.opt.Author != "" {
+		values.Set("author", f.opt.Author)
+	}
 	values.Set("size", "100")
 	values.Set("sort", "desc")
 
@@ -284,7 +340,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		Path:       "/reddit/search/submission",
 		Parameters: values,
 	}
-	
+
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &data)
 		return shouldRetry(ctx, resp, err)
@@ -300,7 +356,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		checkers  = f.ci.Checkers
 		in        = make(chan api.Item, checkers)
 	)
-	
+
 	add := func(entry fs.DirEntry) {
 		entriesMu.Lock()
 		entries = append(entries, entry)
@@ -320,22 +376,37 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				}
 				switch err := file.stat(ctx); err {
 				case nil:
-					add(file)
+					_, ok := f.cache[file.etag]
+					if !ok {
+						add(file)
+						f.cache[file.etag] = ""
+					}
 				default:
 					fs.Debugf(remote, "skipping because of error: %v", err)
 				}
 			}
 		}()
 	}
-	
+
 	for _, e := range data.Data {
-		if e.PostHint != "image" {
-			continue
+		fmt.Printf("%+v\n", e)
+		if e.Domain == "i.redd.it" || e.Domain == "i.imgur.com" {
+			in <- e
 		}
-		in <- e
+		if e.Domain == "redgifs.com" || e.Domain ==  "gfycat.com" {
+			u, _ := url.Parse(e.Url)
+			v := path.Base(u.Path)
+			_, ok := f.cache[v] 
+			if !ok {
+				e.Url = getGfyCat(f, ctx, v)
+				fmt.Printf("%v\n", e.Url)
+				f.cache[v] = ""
+				in <- e				
+			}
+		}
 	}
 	close(in)
-	wg.Wait()	
+	wg.Wait()
 	return entries, nil
 }
 
@@ -383,9 +454,15 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// Hash returns "" since HTTP (in Go or OpenSSH) doesn't support remote calculation of hashes
-func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
-	return "", hash.ErrUnsupported
+// Hash returns the Md5sum of an object returning a lowercase hex string
+func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	if t != hash.MD5 {
+		return "", hash.ErrUnsupported
+	}
+	if o.etag != "" {
+		return o.etag, nil
+	}
+	return "", nil
 }
 
 // Size returns the size in bytes of the remote http file
@@ -440,6 +517,7 @@ func (o *Object) stat(ctx context.Context) error {
 	o.size = parseInt64(res.Header.Get("Content-Length"), -1)
 	o.modTime = t
 	o.contentType = res.Header.Get("Content-Type")
+	o.etag = res.Header.Get("etag")
 	return nil
 }
 
@@ -479,7 +557,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 // Hashes returns hash.HashNone to indicate remote hashing is unavailable
 func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.None)
+	return hash.Set(hash.MD5)
 }
 
 // Mkdir makes the root directory of the Fs object

@@ -44,6 +44,8 @@ func init() {
 		Name:  "reddit",
 		NewFs: NewFs,
 		Options: []fs.Option{{
+			Name: "author",
+		}, {
 			Name:     "no_head",
 			Default:  false,
 			Advanced: true,
@@ -316,14 +318,21 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 				}
 				switch err := file.stat(ctx); err {
 				case nil:
-					cacheMu.Lock()
-					_, ok := f.cache[file.etag]
-					cacheMu.Unlock()
+					ok := false
+					if file.etag != "" {
+						cacheMu.Lock()
+						ok = f.cache[file.etag]
+						cacheMu.Unlock()
+					}
 					if !ok {
 						add(file)
-						cacheMu.Lock()
-						f.cache[file.etag] = true
-						cacheMu.Unlock()
+						if file.etag != "" {
+							cacheMu.Lock()
+							f.cache[file.etag] = true
+							cacheMu.Unlock()
+						}
+					} else {
+						fs.Debugf(remote, "skipping because etag=%v matches", file.etag)
 					}
 				default:
 					fs.Debugf(remote, "skipping because of error: %v", err)
@@ -335,33 +344,44 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 	var created int64
 	for _, e := range data {
 		var (
-			id string
-			ok bool
-			//d  *Dir
+		//id string
+		//ok bool
+		//d  *Dir
 		)
 		if created < e.CreatedUtc {
 			created = e.CreatedUtc
 		}
 		switch e.Domain {
 		case "i.redd.it", "i.imgur.com":
-			if len(e.Preview.Images) > 0 {
+			/*if len(e.Preview.Images) > 0 {
 				id = e.Preview.Images[0].ID
+				cacheMu.Lock()
 				ok = f.cache[id]
+				cacheMu.Unlock()
 			}
 			if !ok {
+				cacheMu.Lock()
 				f.cache[id] = true
+				cacheMu.Unlock()
 				in <- e
-			}
+			} else {
+				fs.Debugf()
+			}*/
+			in <- e
 
 		case "redgifs.com", "gfycat.com":
 			u, _ := url.Parse(e.Url)
 			v := path.Base(u.Path)
-			ok = f.cache[v]
-			if !ok {
-				e.Url = getGfyCat(f, ctx, v)
-				f.cache[v] = true
-				in <- e
-			}
+			//cacheMu.Lock()
+			//ok = f.cache[v]
+			//cacheMu.Unlock()
+			//if !ok {
+			e.Url = getGfyCat(f, ctx, v)
+			//cacheMu.Lock()
+			//f.cache[v] = true
+			//cacheMu.Unlock()
+			in <- e
+			//}
 		}
 	}
 	//f.dirCache.Put(f.opt.Subreddit, f.opt.Subreddit)
@@ -405,7 +425,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	userDir, user := path.Split(dir)
 	if userDir == "" && user == "u" {
-		for _, user := range []string{"Alicebluwu", "yevin70335", "Touched_By_Nature"} {
+		for _, user := range strings.Split(f.opt.Author, ",") {
 			directoryID, _ := f.dirCache.FindDir(ctx, user, false)
 
 			if directoryID == "" {
@@ -687,18 +707,23 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 	err = f.pacer.CallNoRetry(func() (bool, error) {
 		for author, u := range f.users {
 			go func(author string, u User) {
-				data, err := f.getPushshift(ctx, "", author, u.before)
-				before := data[len(data)-1].CreatedUtc
+				if author != "" {
+					data, err := f.getPushshift(ctx, "", author, u.before)
+					if len(data) == 0 {
+						return
+					}
+					before := data[len(data)-1].CreatedUtc
 
-				if err != nil {
+					if err != nil {
+					}
+
+					entries, err := f.list(ctx, "u/"+author, data)
+					entries = append(u.entries, entries...)
+					u.entries = entries
+					u.before = before
+					f.users[author] = u
+					notifyFunc("u/"+author, fs.EntryDirectory)
 				}
-
-				entries, err := f.list(ctx, "u/"+author, data)
-				entries = append(u.entries, entries...)
-				u.entries = entries
-				u.before = before
-				f.users[author] = u
-				notifyFunc("u/"+author, fs.EntryDirectory)
 			}(author, u)
 		}
 		return false, err

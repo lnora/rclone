@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -48,7 +49,17 @@ func init() {
 			Name:     "no_head",
 			Default:  false,
 			Advanced: true,
-		}},
+		},
+			{
+				Name:     "ps_size",
+				Default:  25,
+				Advanced: true,
+			},
+			{
+				Name:     "small_pics",
+				Default:  false,
+				Advanced: true,
+			}},
 
 		MetadataInfo: &fs.MetadataInfo{
 			System: map[string]fs.MetadataHelp{
@@ -68,6 +79,8 @@ type Options struct {
 	Author     string `config:"author"`
 	NoHead     bool   `config:"no_head"`
 	Checkpoint string `config:"checkpoint"`
+	PsSize     int    `config:"ps_size"`
+	SmallPics  bool   `config:"small_pics"`
 }
 
 type User struct {
@@ -224,9 +237,15 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 
 func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 	type GfyCat struct {
-		GfyItem struct {
-			Mp4URL string `json:"mp4Url"`
-		} `json:"gfyItem"`
+		Gif struct {
+			Urls struct {
+				Poster     string `json:"poster"`
+				Vthumbnail string `json:"vthumbnail"`
+				Thumbnail  string `json:"thumbnail"`
+				Sd         string `json:"sd"`
+				Hd         string `json:"hd"`
+			} `json:"urls"`
+		} `json:"gif"`
 	}
 
 	var (
@@ -237,7 +256,7 @@ func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 
 	opts := rest.Opts{
 		Method:  "GET",
-		Path:    "/v1/gfycats/" + name,
+		Path:    "/v2/gifs/" + name,
 		RootURL: "https://api.redgifs.com",
 	}
 
@@ -250,7 +269,12 @@ func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 		fmt.Printf("%+v\n", err)
 		return ""
 	}
-	return gfycat.GfyItem.Mp4URL
+
+	if gfycat.Gif.Urls.Hd != "" {
+		return gfycat.Gif.Urls.Hd
+	}
+
+	return gfycat.Gif.Urls.Sd
 }
 
 func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before int64) (items []api.Item, err error) {
@@ -267,7 +291,7 @@ func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before 
 	if author != "" {
 		values.Set("author", author)
 	}
-	values.Set("size", "25")
+	values.Set("size", strconv.Itoa(f.opt.PsSize))
 	values.Set("sort", "desc")
 	values.Set("before", strconv.FormatInt(before, 10))
 
@@ -285,13 +309,15 @@ func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before 
 		fmt.Printf("...Error %v\n", err)
 		return nil, err
 	}
-	return data.Data, nil
+	if len(data.Data) == 0 {
+		err = errors.New("no data")
+	}
+	return data.Data, err
 }
 
 func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries fs.DirEntries, err error) {
 	var (
 		entriesMu sync.Mutex // to protect entries
-		cacheMu   sync.Mutex
 		wg        sync.WaitGroup
 		checkers  = f.ci.Checkers
 		in        = make(chan api.Item, checkers)
@@ -308,8 +334,13 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 			defer wg.Done()
 			for remote := range in {
 				u, _ := url.Parse(remote.Url)
+				base := path.Base(u.Path)
+				if strings.HasPrefix(base, "DASH_1080.mp4") {
+					_, file := path.Split(path.Dir(u.Path))
+					base = file + "_" + base
+				}
 				file := &Object{
-					remote:    path.Join(dirID, strings.Trim(u.Path, "/")),
+					remote:    path.Join(dirID, strings.Trim(base, "/")),
 					fs:        f,
 					id:        remote.Id,
 					remoteUrl: remote.Url,
@@ -318,16 +349,17 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 				case nil:
 					ok := false
 					if file.etag != "" {
-						cacheMu.Lock()
+						entriesMu.Lock()
 						ok = f.cache[file.etag]
-						cacheMu.Unlock()
+						entriesMu.Unlock()
 					}
 					if !ok {
+						file.modTime = time.Unix(remote.CreatedUtc, 0)
 						add(file)
 						if file.etag != "" {
-							cacheMu.Lock()
+							entriesMu.Lock()
 							f.cache[file.etag] = true
-							cacheMu.Unlock()
+							entriesMu.Unlock()
 						}
 					} else {
 						fs.Debugf(remote, "skipping because etag=%v matches", file.etag)
@@ -343,44 +375,57 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 	for _, e := range data {
 		//fs.Debugf(f, "%+v", e)
 		var (
-		//id string
-		//ok bool
+			id       string
+			ok       bool
+			thumbUrl string
 		//d  *Dir
 		)
+		if len(e.Preview.Images) > 0 {
+			id = e.Preview.Images[0].ID
+			if len(e.Preview.Images[0].Resolutions) > 0 {
+				thumbUrl = html.UnescapeString(e.Preview.Images[0].Resolutions[len(e.Preview.Images[0].Resolutions)-1].Url)
+			}
+			entriesMu.Lock()
+			ok = f.cache[id]
+			entriesMu.Unlock()
+		}
 		if created < e.CreatedUtc {
 			created = e.CreatedUtc
 		}
 		switch e.Domain {
 		case "i.redd.it", "i.imgur.com":
-			/*if len(e.Preview.Images) > 0 {
-				id = e.Preview.Images[0].ID
-				cacheMu.Lock()
-				ok = f.cache[id]
-				cacheMu.Unlock()
-			}
+
 			if !ok {
-				cacheMu.Lock()
+				entriesMu.Lock()
 				f.cache[id] = true
-				cacheMu.Unlock()
+				entriesMu.Unlock()
+				if f.opt.SmallPics {
+					e.Url = thumbUrl
+				}
 				in <- e
 			} else {
-				fs.Debugf()
-			}*/
-			in <- e
+				fs.Debugf(f, "skipping %v", e.Url)
+			}
 
 		case "redgifs.com", "gfycat.com":
 			u, _ := url.Parse(e.Url)
 			v := path.Base(u.Path)
-			//cacheMu.Lock()
-			//ok = f.cache[v]
-			//cacheMu.Unlock()
-			//if !ok {
-			e.Url = getGfyCat(f, ctx, v)
-			//cacheMu.Lock()
-			//f.cache[v] = true
-			//cacheMu.Unlock()
-			in <- e
-		//}
+			entriesMu.Lock()
+			ok = f.cache[v]
+			entriesMu.Unlock()
+			if !ok {
+				if f.opt.SmallPics {
+					e.Url = html.UnescapeString(e.Preview.RedditVideoPreview.FallbackUrl)
+				} else {
+					e.Url = getGfyCat(f, ctx, v)
+				}
+				entriesMu.Lock()
+				f.cache[v] = true
+				entriesMu.Unlock()
+				in <- e
+			} else {
+				fs.Debugf(f, "skipping %v", e.Url)
+			}
 
 		default:
 			fs.Debugf(f, "ignoring %+v", e)
@@ -441,27 +486,28 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	} else if userDir == "u/" {
 		//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
 		u = f.users[user]
-		if len(u.entries) == 0 {
-			before := u.before
-			if before == 0 {
-				before = time.Now().Unix()
-			}
-
-			data, err = f.getPushshift(ctx, "", user, before)
-
-			if err != nil {
-				return nil, fmt.Errorf("couldn't list files: %w", err)
-			}
-
-			before = data[len(data)-1].CreatedUtc
-			u.before = before
-
-			entries, err = f.list(ctx, dir, data)
-
-			entries = append(u.entries, entries...)
-			u.entries = entries
-			f.users[user] = u
+		//if len(u.entries) == 0 {
+		before := u.before
+		if before == 0 {
+			before = time.Now().Unix()
 		}
+
+		data, err = f.getPushshift(ctx, "", user, before)
+
+		if err != nil {
+			entries = append(u.entries, entries...)
+			return nil, fmt.Errorf("couldn't list files: %w", err)
+		}
+
+		before = data[len(data)-1].CreatedUtc
+		u.before = before
+
+		entries, err = f.list(ctx, dir, data)
+
+		entries = append(u.entries, entries...)
+		u.entries = entries
+		f.users[user] = u
+		//}
 	}
 
 	return entries, err

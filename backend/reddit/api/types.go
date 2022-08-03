@@ -14,7 +14,13 @@ type Item struct {
 	Url        string `json:"url"`
 	Preview    struct {
 		Images []struct {
-			ID string `json:"id"`
+			ID          string `json:"id"`
+			Resolutions []struct {
+				Url string `json:"url"`
+			} `json:"resolutions"`
 		} `json:"images"`
+		RedditVideoPreview struct {
+			FallbackUrl string `json:"fallback_url"`
+		} `json:"reddit_video_preview"`
 	} `json:"preview"`
 }

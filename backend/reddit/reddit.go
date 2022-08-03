@@ -15,7 +15,6 @@ import (
 
 	"github.com/rclone/rclone/backend/reddit/api"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -72,9 +71,8 @@ type Options struct {
 }
 
 type User struct {
-	before     int64
-	lastBefore int64
-	entries    fs.DirEntries
+	before  int64
+	entries fs.DirEntries
 }
 
 // Fs stores the interface to the remote HTTP files
@@ -167,7 +165,7 @@ func (f *Fs) Root() string {
 
 // String returns the URL for the filesystem
 func (f *Fs) String() string {
-	return "/r/18_19"
+	return fmt.Sprintf("root '%s'", f.root)
 }
 
 // Features returns the optional features of this Fs
@@ -343,6 +341,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 
 	var created int64
 	for _, e := range data {
+		//fs.Debugf(f, "%+v", e)
 		var (
 		//id string
 		//ok bool
@@ -381,7 +380,10 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 			//f.cache[v] = true
 			//cacheMu.Unlock()
 			in <- e
-			//}
+		//}
+
+		default:
+			fs.Debugf(f, "ignoring %+v", e)
 		}
 	}
 	//f.dirCache.Put(f.opt.Subreddit, f.opt.Subreddit)
@@ -416,7 +418,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	case "":
 		for _, it := range []string{"r/", "u/"} {
 			remote = path.Join(dir, it)
-			f.dirCache.Put(remote, it)
+			//f.dirCache.Put(remote, it)
 			d := fs.NewDir(remote, time.Now()).SetID(it)
 			entries = append(entries, d)
 		}
@@ -426,20 +428,20 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	userDir, user := path.Split(dir)
 	if userDir == "" && user == "u" {
 		for _, user := range strings.Split(f.opt.Author, ",") {
-			directoryID, _ := f.dirCache.FindDir(ctx, user, false)
+			//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
 
-			if directoryID == "" {
-				remote = path.Join(dir, user)
-				f.dirCache.Put(remote, user)
-				d := fs.NewDir(remote, time.Now()).SetID(user)
-				entries = append(entries, d)
-			}
+			//if directoryID == "" {
+			remote = path.Join(dir, user)
+			f.dirCache.Put(remote, user)
+			d := fs.NewDir(remote, time.Now()).SetID(user)
+			entries = append(entries, d)
+			//}
 		}
 		return entries, err
 	} else if userDir == "u/" {
-		directoryID, _ := f.dirCache.FindDir(ctx, user, false)
+		//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
 		u = f.users[user]
-		if directoryID == "" || len(u.entries) == 0 {
+		if len(u.entries) == 0 {
 			before := u.before
 			if before == 0 {
 				before = time.Now().Unix()
@@ -663,8 +665,6 @@ func (o *Object) MimeType(ctx context.Context) string {
 //
 // Close the returned channel to stop being notified.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
-	checkpoint := f.opt.Checkpoint
-
 	go func() {
 		var ticker *time.Ticker
 		var tickerC <-chan time.Time
@@ -687,28 +687,21 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 					tickerC = ticker.C
 				}
 			case <-tickerC:
-				checkpoint = f.changeNotifyRunner(ctx, notifyFunc, checkpoint)
-				if err := config.SetValueAndSave(f.name, "checkpoint", checkpoint); err != nil {
-					fs.Debugf(f, "Unable to save checkpoint: %v", err)
-				}
+				f.changeNotifyRunner(ctx, notifyFunc)
 			}
 		}
 	}()
 }
 
-func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), checkpoint string) string {
+func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType)) {
 	var err error
-	type entryType struct {
-		path      string
-		entryType fs.EntryType
-	}
 
-	fs.Debugf(f, "Checking for changes on remote (Checkpoint %q)", checkpoint)
+	fs.Debugf(f, "Checking for changes on remote ")
 	err = f.pacer.CallNoRetry(func() (bool, error) {
 		for author, u := range f.users {
 			go func(author string, u User) {
 				if author != "" {
-					data, err := f.getPushshift(ctx, "", author, u.before)
+					/*data, err := f.getPushshift(ctx, "", author, u.before)
 					if len(data) == 0 {
 						return
 					}
@@ -721,14 +714,13 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 					entries = append(u.entries, entries...)
 					u.entries = entries
 					u.before = before
-					f.users[author] = u
+					f.users[author] = u*/
 					notifyFunc("u/"+author, fs.EntryDirectory)
 				}
 			}(author, u)
 		}
 		return false, err
 	})
-	return checkpoint
 }
 
 // Check the interfaces are satisfied

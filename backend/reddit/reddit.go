@@ -2,6 +2,7 @@ package reddit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -45,11 +46,14 @@ func init() {
 		NewFs: NewFs,
 		Options: []fs.Option{{
 			Name: "author",
-		}, {
-			Name:     "no_head",
-			Default:  false,
-			Advanced: true,
 		},
+			{
+				Name: "subreddit",
+			}, {
+				Name:     "no_head",
+				Default:  false,
+				Advanced: true,
+			},
 			{
 				Name:     "ps_size",
 				Default:  25,
@@ -117,6 +121,7 @@ type Object struct {
 	id          string // ID of the object
 	remoteUrl   string
 	etag        string
+	rawData     json.RawMessage
 }
 
 // statusError returns an error if the res contained an error
@@ -158,7 +163,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		subreddits: map[string]string{},
 	}
 	f.features = (&fs.Features{
-		CanHaveEmptyDirectories: true,
+		CanHaveEmptyDirectories: false,
+		ReadMetadata:            true,
+		WriteMetadata:           true,
 	}).Fill(ctx, f)
 
 	f.dirCache = dircache.New(root, root, f)
@@ -344,6 +351,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 					fs:        f,
 					id:        remote.Id,
 					remoteUrl: remote.Url,
+					//rawData:   remote.rawData,
 				}
 				switch err := file.stat(ctx); err {
 				case nil:
@@ -496,7 +504,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 		if err != nil {
 			entries = append(u.entries, entries...)
-			return nil, fmt.Errorf("couldn't list files: %w", err)
+			return entries, fmt.Errorf("couldn't list files: %w", err)
 		}
 
 		before = data[len(data)-1].CreatedUtc
@@ -592,6 +600,43 @@ func (o *Object) Size() int64 {
 // ModTime returns the modification time of the remote http file
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
+}
+
+// Metadata returns all file metadata provided by Internet Archive
+func (o *Object) Metadata(ctx context.Context) (m fs.Metadata, err error) {
+	if o.rawData == nil {
+		return nil, nil
+	}
+	raw := make(map[string]json.RawMessage)
+	err = json.Unmarshal(o.rawData, &raw)
+	if err != nil {
+		// fatal: json parsing failed
+		return
+	}
+	for k, v := range raw {
+		items, err := listOrString(v)
+		if len(items) == 0 || err != nil {
+			// skip: an entry failed to parse
+			continue
+		}
+		m.Set(k, items[0])
+	}
+	return
+}
+
+func listOrString(jm json.RawMessage) (rmArray []string, err error) {
+	// rclone-metadata can be an array or string
+	// try to deserialize it as array first
+	err = json.Unmarshal(jm, &rmArray)
+	if err != nil {
+		// if not, it's a string
+		dst := new(string)
+		err = json.Unmarshal(jm, dst)
+		if err == nil {
+			rmArray = []string{*dst}
+		}
+	}
+	return
 }
 
 // url returns the native url of the object

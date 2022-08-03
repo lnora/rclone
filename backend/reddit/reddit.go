@@ -400,6 +400,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		if created < e.CreatedUtc {
 			created = e.CreatedUtc
 		}
+
 		switch e.Domain {
 		case "i.redd.it", "i.imgur.com":
 
@@ -408,7 +409,12 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 				f.cache[id] = true
 				entriesMu.Unlock()
 				if f.opt.SmallPics {
-					e.Url = thumbUrl
+					switch e.PostHint {
+					case "image":
+						e.Url = thumbUrl
+					default:
+						e.Url = html.UnescapeString(e.Preview.RedditVideoPreview.FallbackUrl)
+					}
 				}
 				in <- e
 			} else {

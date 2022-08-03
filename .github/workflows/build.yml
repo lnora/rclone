@@ -20,12 +20,12 @@ on:
 
 jobs:
   build:
-    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
+    if: ${{ github.repository == 'lnora/rclone' || github.event.inputs.manual }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        job_name: ['linux', 'linux_386', 'mac_amd64', 'mac_arm64', 'windows', 'other_os', 'go1.17', 'go1.18']
+        job_name: ['linux', 'windows']
 
         include:
           - job_name: linux
@@ -34,32 +34,9 @@ jobs:
             gotags: cmount
             build_flags: '-include "^linux/"'
             check: true
-            quicktest: true
-            racequicktest: true
-            librclonetest: true
-            deploy: true
-
-          - job_name: linux_386
-            os: ubuntu-latest
-            go: '1.19.x'
-            goarch: 386
-            gotags: cmount
-            quicktest: true
-
-          - job_name: mac_amd64
-            os: macos-11
-            go: '1.19.x'
-            gotags: 'cmount'
-            build_flags: '-include "^darwin/amd64" -cgo'
-            quicktest: true
-            racequicktest: true
-            deploy: true
-
-          - job_name: mac_arm64
-            os: macos-11
-            go: '1.19.x'
-            gotags: 'cmount'
-            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
+            quicktest: false
+            racequicktest: false
+            librclonetest: false
             deploy: true
 
           - job_name: windows
@@ -69,27 +46,8 @@ jobs:
             cgo: '0'
             build_flags: '-include "^windows/"'
             build_args: '-buildmode exe'
-            quicktest: true
+            quicktest: false
             deploy: true
-
-          - job_name: other_os
-            os: ubuntu-latest
-            go: '1.19.x'
-            build_flags: '-exclude "^(windows/|darwin/|linux/)"'
-            compile_all: true
-            deploy: true
-
-          - job_name: go1.17
-            os: ubuntu-latest
-            go: '1.17.x'
-            quicktest: true
-            racequicktest: true
-
-          - job_name: go1.18
-            os: ubuntu-latest
-            go: '1.18.x'
-            quicktest: true
-            racequicktest: true
 
     name: ${{ matrix.job_name }}
 
@@ -125,13 +83,6 @@ jobs:
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get install fuse libfuse-dev rpm pkg-config
         if: matrix.os == 'ubuntu-latest'
-
-      - name: Install Libraries on macOS
-        shell: bash
-        run: |
-          brew update
-          brew install --cask macfuse
-        if: matrix.os == 'macos-11'
 
       - name: Install Libraries on Windows
         shell: powershell
@@ -209,17 +160,21 @@ jobs:
       - name: Deploy built binaries
         shell: bash
         run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then make release_dep_windows ; fi
-          make ci_beta
-        env:
-          RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
-        # working-directory: '$(modulePath)'
+          set -x
+          assets=()
+          for asset in build/*; do
+            assets+=("-a" "$asset")
+          done
+          tag_name="${GITHUB_SHA##*/}"
+          hub release create -d "${assets[@]}" "$tag_name"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         # Deploy binaries if enabled in config && not a PR && not a fork
-        if: matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
+        if: matrix.deploy && github.head_ref == '' && github.repository == 'lnora/rclone'
 
   lint:
-    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
+    if: ${{ github.repository == 'rclone/rclone' && github.event.inputs.manual }}
     timeout-minutes: 30
     name: "lint"
     runs-on: ubuntu-latest
@@ -238,7 +193,7 @@ jobs:
           version: latest
 
   android:
-    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
+    if: ${{ github.repository == 'rclone/rclone' && github.event.inputs.manual }}
     timeout-minutes: 30
     name: "android-all"
     runs-on: ubuntu-latest

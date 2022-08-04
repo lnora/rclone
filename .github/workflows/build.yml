@@ -165,10 +165,10 @@ jobs:
           for asset in build/*; do
             assets+=("-a" "$asset")
           done
-          tag_name="${GITHUB_SHA##*/}"
+          tag_name="${{ github.sha }}"
           hub release create -d "${assets[@]}" "$tag_name"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
         # Deploy binaries if enabled in config && not a PR && not a fork
         if: matrix.deploy && github.head_ref == '' && github.repository == 'lnora/rclone'

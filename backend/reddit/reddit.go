@@ -108,7 +108,7 @@ type Fs struct {
 	dirCache   *dircache.DirCache // Map of directory path to directory id
 	users      map[string]User
 	//usersData  map[string]fs.DirEntries
-	subreddits map[string]string
+	subreddits map[string]User
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -160,7 +160,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		cache:      map[string]bool{},
 		users:      map[string]User{},
 		//usersData:  map[string]fs.DirEntries{},
-		subreddits: map[string]string{},
+		subreddits: map[string]User{},
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: false,
@@ -463,9 +463,9 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	var (
-		data   []api.Item
-		remote string
-		u      User
+		data     []api.Item
+		remote   string
+		userItem User
 	)
 
 	/*directoryID, err := f.dirCache.FindDir(ctx, dir, false)
@@ -485,43 +485,69 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	userDir, user := path.Split(dir)
-	if userDir == "" && user == "u" {
-		for _, user := range strings.Split(f.opt.Author, ",") {
+	if userDir == "" {
+		populateRootTypeDirs := func(user string, items string) (entries fs.DirEntries, err error) {
+			for _, item := range strings.Split(items, ",") {
+				//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
+
+				//if directoryID == "" {
+				remote = path.Join(dir, item)
+				f.dirCache.Put(remote, item)
+				d := fs.NewDir(remote, time.Time{}).SetID(item)
+				entries = append(entries, d)
+				//}
+			}
+			return entries, err
+		}
+		switch user {
+		case "u":
+			return populateRootTypeDirs(user, f.opt.Author)
+		case "r":
+			return populateRootTypeDirs(user, f.opt.Subreddit)
+		}
+	} else {
+		populateDirs := func(m map[string]User, key string, keyType string) (entries fs.DirEntries, err error) {
+			var (
+				subreddit, author string
+			)
+			switch keyType {
+			case "u/":
+				author = key
+			case "r/":
+				subreddit = key
+			}
 			//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
+			userItem = m[key]
+			//if len(u.entries) == 0 {
+			before := userItem.before
+			if before == 0 {
+				before = time.Now().Unix()
+			}
 
-			//if directoryID == "" {
-			remote = path.Join(dir, user)
-			f.dirCache.Put(remote, user)
-			d := fs.NewDir(remote, time.Now()).SetID(user)
-			entries = append(entries, d)
+			data, err = f.getPushshift(ctx, subreddit, author, before)
+
+			if err != nil {
+				entries = append(userItem.entries, entries...)
+				return entries, fmt.Errorf("couldn't list files: %w", err)
+			}
+
+			before = data[len(data)-1].CreatedUtc
+			userItem.before = before
+
+			entries, err = f.list(ctx, dir, data)
+
+			entries = append(userItem.entries, entries...)
+			userItem.entries = entries
+			m[key] = userItem
 			//}
+			return entries, err
 		}
-		return entries, err
-	} else if userDir == "u/" {
-		//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
-		u = f.users[user]
-		//if len(u.entries) == 0 {
-		before := u.before
-		if before == 0 {
-			before = time.Now().Unix()
+		switch userDir {
+		case "u/":
+			return populateDirs(f.users, user, userDir)
+		case "r/":
+			return populateDirs(f.subreddits, user, userDir)
 		}
-
-		data, err = f.getPushshift(ctx, "", user, before)
-
-		if err != nil {
-			entries = append(u.entries, entries...)
-			return entries, fmt.Errorf("couldn't list files: %w", err)
-		}
-
-		before = data[len(data)-1].CreatedUtc
-		u.before = before
-
-		entries, err = f.list(ctx, dir, data)
-
-		entries = append(u.entries, entries...)
-		u.entries = entries
-		f.users[user] = u
-		//}
 	}
 
 	return entries, err

@@ -23,4 +23,5 @@ type Item struct {
 			FallbackUrl string `json:"fallback_url"`
 		} `json:"reddit_video_preview"`
 	} `json:"preview"`
+	Stat bool
 }

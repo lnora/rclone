@@ -11,8 +11,13 @@ type Item struct {
 	Id         string `json:"id"`
 	Domain     string `json:"domain"`
 	PostHint   string `json:"post_hint"`
-	Url        string `json:"url"`
-	Preview    struct {
+	Media      struct {
+		Oembed struct {
+			ThumbnailUrl string `json:"thumbnail_url"`
+		} `json:"oembed"`
+	} `json:"media"`
+	Url     string `json:"url"`
+	Preview struct {
 		Images []struct {
 			ID          string `json:"id"`
 			Resolutions []struct {

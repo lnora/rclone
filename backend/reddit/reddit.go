@@ -61,7 +61,7 @@ func init() {
 			},
 			{
 				Name:     "small_pics",
-				Default:  false,
+				Default:  -1,
 				Advanced: true,
 			}},
 
@@ -84,11 +84,12 @@ type Options struct {
 	NoHead     bool   `config:"no_head"`
 	Checkpoint string `config:"checkpoint"`
 	PsSize     int    `config:"ps_size"`
-	SmallPics  bool   `config:"small_pics"`
+	SmallPics  int    `config:"small_pics"`
 }
 
 type User struct {
 	before  int64
+	after   int64
 	entries fs.DirEntries
 }
 
@@ -284,8 +285,8 @@ func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 	return gfycat.Gif.Urls.Sd
 }
 
-func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before int64) (items []api.Item, err error) {
-	defer log.Trace(f, "subreddit=%v,author=%v,before=%v", subreddit, author, before)
+func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before int64, after int64) (items []api.Item, err error) {
+	defer log.Trace(f, "subreddit=%v,author=%v,before=%v,after=%v", subreddit, author, before, after)
 	var (
 		data *api.ListItems
 		resp *http.Response
@@ -300,7 +301,12 @@ func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before 
 	}
 	values.Set("size", strconv.Itoa(f.opt.PsSize))
 	values.Set("sort", "desc")
-	values.Set("before", strconv.FormatInt(before, 10))
+	if before != 0 {
+		values.Set("before", strconv.FormatInt(before, 10))
+	}
+	if after != 0 {
+		values.Set("after", strconv.FormatInt(after, 10))
+	}
 
 	opts := rest.Opts{
 		Method:     "GET",
@@ -316,15 +322,17 @@ func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before 
 		fmt.Printf("...Error %v\n", err)
 		return nil, err
 	}
-	if len(data.Data) == 0 {
+	/*if len(data.Data) == 0 {
 		err = errors.New("no data")
-	}
+	}*/
 	return data.Data, err
 }
 
 func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries fs.DirEntries, err error) {
+	defer log.Trace(f, "dirID=%v", dirID)
 	var (
 		entriesMu sync.Mutex // to protect entries
+		etagsMu   sync.RWMutex
 		wg        sync.WaitGroup
 		checkers  = f.ci.Checkers
 		in        = make(chan api.Item, checkers)
@@ -346,28 +354,29 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 					_, file := path.Split(path.Dir(u.Path))
 					base = file + "_" + base
 				}
+				jsonIn, _ := json.Marshal(&remote)
 				file := &Object{
 					remote:    path.Join(dirID, strings.Trim(base, "/")),
 					fs:        f,
 					id:        remote.Id,
 					remoteUrl: remote.Url,
-					//rawData:   remote.rawData,
+					rawData:   json.RawMessage(jsonIn),
 				}
 				switch err := file.stat(ctx); err {
 				case nil:
 					ok := false
 					if file.etag != "" {
-						entriesMu.Lock()
+						etagsMu.RLock()
 						ok = f.cache[file.etag]
-						entriesMu.Unlock()
+						etagsMu.RUnlock()
 					}
 					if !ok {
 						file.modTime = time.Unix(remote.CreatedUtc, 0)
 						add(file)
 						if file.etag != "" {
-							entriesMu.Lock()
+							etagsMu.Lock()
 							f.cache[file.etag] = true
-							entriesMu.Unlock()
+							etagsMu.Unlock()
 						}
 					} else {
 						fs.Debugf(remote, "skipping because etag=%v matches", file.etag)
@@ -391,11 +400,16 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		if len(e.Preview.Images) > 0 {
 			id = e.Preview.Images[0].ID
 			if len(e.Preview.Images[0].Resolutions) > 0 {
-				thumbUrl = html.UnescapeString(e.Preview.Images[0].Resolutions[len(e.Preview.Images[0].Resolutions)-1].Url)
+				smallPics := f.opt.SmallPics
+				var i int = len(e.Preview.Images[0].Resolutions) - 1
+				if smallPics != -1 && smallPics <= len(e.Preview.Images[0].Resolutions)-1 {
+					i = smallPics
+				}
+				thumbUrl = html.UnescapeString(e.Preview.Images[0].Resolutions[i].Url)
 			}
-			entriesMu.Lock()
+			etagsMu.RLock()
 			ok = f.cache[id]
-			entriesMu.Unlock()
+			etagsMu.RUnlock()
 		}
 		if created < e.CreatedUtc {
 			created = e.CreatedUtc
@@ -405,15 +419,21 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		case "i.redd.it", "i.imgur.com":
 
 			if !ok {
-				entriesMu.Lock()
+				if strings.HasSuffix(e.Url, ".gifv") {
+					e.Url = strings.Replace(e.Url, ".gifv", ".mp4", -1)
+				}
+				etagsMu.Lock()
 				f.cache[id] = true
-				entriesMu.Unlock()
-				if f.opt.SmallPics {
+				etagsMu.Unlock()
+				if f.opt.SmallPics > -1 {
 					switch e.PostHint {
 					case "image":
 						e.Url = thumbUrl
-					default:
-						e.Url = html.UnescapeString(e.Preview.RedditVideoPreview.FallbackUrl)
+					case "rich:video":
+						fallbackUrl := e.Preview.RedditVideoPreview.FallbackUrl
+						if fallbackUrl != "" {
+							e.Url = html.UnescapeString(fallbackUrl)
+						}
 					}
 				}
 				in <- e
@@ -424,18 +444,31 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		case "redgifs.com", "gfycat.com":
 			u, _ := url.Parse(e.Url)
 			v := path.Base(u.Path)
-			entriesMu.Lock()
+			etagsMu.RLock()
 			ok = f.cache[v]
-			entriesMu.Unlock()
+			etagsMu.RUnlock()
 			if !ok {
-				if f.opt.SmallPics {
-					e.Url = html.UnescapeString(e.Preview.RedditVideoPreview.FallbackUrl)
+				if f.opt.SmallPics != -1 {
+					fallbackUrl := e.Preview.RedditVideoPreview.FallbackUrl
+					if fallbackUrl != "" {
+						e.Url = html.UnescapeString(fallbackUrl)
+					} else {
+						fallbackUrl = e.Media.Oembed.ThumbnailUrl
+						if fallbackUrl != "" {
+							if strings.HasSuffix(fallbackUrl, "-mobile.jpg") {
+								fallbackUrl = strings.Replace(fallbackUrl, "-mobile.jpg", ".mp4", -1)
+							}
+							e.Url = fallbackUrl
+						} else {
+							e.Url = getGfyCat(f, ctx, v)
+						}
+					}
 				} else {
 					e.Url = getGfyCat(f, ctx, v)
 				}
-				entriesMu.Lock()
+				etagsMu.Lock()
 				f.cache[v] = true
-				entriesMu.Unlock()
+				etagsMu.Unlock()
 				in <- e
 			} else {
 				fs.Debugf(f, "skipping %v", e.Url)
@@ -462,6 +495,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	defer log.Trace(f, "dir=%v", dir)
 	var (
 		data     []api.Item
 		remote   string
@@ -507,6 +541,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 	} else {
 		populateDirs := func(m map[string]User, key string, keyType string) (entries fs.DirEntries, err error) {
+			defer log.Trace(f, "key=%v,keyType=%v", key, keyType)
 			var (
 				subreddit, author string
 			)
@@ -522,23 +557,55 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			before := userItem.before
 			if before == 0 {
 				before = time.Now().Unix()
+				userItem.before = before
 			}
+			after := userItem.after
 
-			data, err = f.getPushshift(ctx, subreddit, author, before)
+			fetch := func(flag bool) (entries fs.DirEntries, err error) {
+				defer log.Trace(f, "flag=%v", flag)
+				if flag {
+					data, err = f.getPushshift(ctx, subreddit, author, before, 0)
+				} else if after != 0 {
+					data, err = f.getPushshift(ctx, subreddit, author, 0, after)
+				}
 
-			if err != nil {
+				if err != nil {
+					entries = append(userItem.entries, entries...)
+					return entries, fmt.Errorf("couldn't list files: %w", err)
+				}
+
+				min := func(a, b int64) int64 {
+					if a < b {
+						return a
+					}
+					return b
+				}
+				max := func(a, b int64) int64 {
+					if a < b {
+						return b
+					}
+					return a
+				}
+
+				if len(data) > 0 {
+					before = data[len(data)-1].CreatedUtc
+					after = data[0].CreatedUtc
+					userItem.before = min(userItem.before, before)
+					userItem.after = max(userItem.after, after)
+
+					entries, err = f.list(ctx, dir, data)
+				}
+
 				entries = append(userItem.entries, entries...)
+				userItem.entries = entries
+				m[key] = userItem
+				return entries, err
+			}
+			entries, err = fetch(true)
+			if err != nil {
 				return entries, fmt.Errorf("couldn't list files: %w", err)
 			}
-
-			before = data[len(data)-1].CreatedUtc
-			userItem.before = before
-
-			entries, err = f.list(ctx, dir, data)
-
-			entries = append(userItem.entries, entries...)
-			userItem.entries = entries
-			m[key] = userItem
+			entries, err = fetch(false)
 			//}
 			return entries, err
 		}
@@ -687,6 +754,7 @@ func parseInt64(s string, def int64) int64 {
 
 // stat updates the info field in the Object
 func (o *Object) stat(ctx context.Context) error {
+	//defer log.Trace(o, "o.url=%v", o.url())
 	if o.fs.opt.NoHead {
 		o.size = -1
 		o.modTime = timeUnset

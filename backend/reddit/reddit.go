@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -24,21 +25,39 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
 
 const (
-	minSleep      = 1 * time.Second
-	maxSleep      = 5 * time.Second
-	decayConstant = 1
-	rootURL       = "https://api.pushshift.io"
+	minSleep        = 1 * time.Second
+	maxSleep        = 5 * time.Second
+	decayConstant   = 1
+	rootURL         = "https://api.pushshift.io"
+	userPrefix      = "u/"
+	subredditPrefix = "r/"
 )
 
 var (
 	errorReadOnly = errors.New("reddit remotes are read only")
 	timeUnset     = time.Unix(0, 0)
+	entriesMu     sync.Mutex // to protect entries
 )
+
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int64) int64 {
+	if a < b {
+		return b
+	}
+	return a
+}
 
 func init() {
 	fsi := &fs.RegInfo{
@@ -79,18 +98,22 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Subreddit  string `config:"subreddit"`
-	Author     string `config:"author"`
-	NoHead     bool   `config:"no_head"`
-	Checkpoint string `config:"checkpoint"`
-	PsSize     int    `config:"ps_size"`
-	SmallPics  int    `config:"small_pics"`
+	Subreddit  string               `config:"subreddit"`
+	Author     string               `config:"author"`
+	NoHead     bool                 `config:"no_head"`
+	Checkpoint string               `config:"checkpoint"`
+	PsSize     int                  `config:"ps_size"`
+	SmallPics  int                  `config:"small_pics"`
+	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
+// User is a single Pushshift
 type User struct {
-	before  int64
-	after   int64
-	entries fs.DirEntries
+	before       int64
+	after        int64
+	firstCreated int64
+	lastCreated  int64
+	entries      fs.DirEntries
 }
 
 // Fs stores the interface to the remote HTTP files
@@ -107,9 +130,8 @@ type Fs struct {
 	cache      map[string]bool
 	httpClient *http.Client
 	dirCache   *dircache.DirCache // Map of directory path to directory id
-	users      map[string]User
 	//usersData  map[string]fs.DirEntries
-	subreddits map[string]User
+	items map[string]User
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -120,9 +142,10 @@ type Object struct {
 	modTime     time.Time
 	contentType string
 	id          string // ID of the object
-	remoteUrl   string
+	remoteURL   string
 	etag        string
-	rawData     json.RawMessage
+	sourceURL   string
+	rawData     *json.RawMessage
 }
 
 // statusError returns an error if the res contained an error
@@ -159,9 +182,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		srv:        rest.NewClient(client).SetRoot(rootURL),
 		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		cache:      map[string]bool{},
-		users:      map[string]User{},
-		//usersData:  map[string]fs.DirEntries{},
-		subreddits: map[string]User{},
+		items:      map[string]User{},
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: false,
@@ -243,7 +264,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
-func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
+func getGfyCat(ctx context.Context, f *Fs, name string) (u string) {
 	type GfyCat struct {
 		Gif struct {
 			Urls struct {
@@ -285,7 +306,7 @@ func getGfyCat(f *Fs, ctx context.Context, name string) (u string) {
 	return gfycat.Gif.Urls.Sd
 }
 
-func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before int64, after int64) (items []api.Item, err error) {
+func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before int64, after int64) (items []api.Item, err error) {
 	defer log.Trace(f, "subreddit=%v,author=%v,before=%v,after=%v", subreddit, author, before, after)
 	var (
 		data *api.ListItems
@@ -329,13 +350,11 @@ func (f *Fs) getPushshift(ctx context.Context, subreddit, author string, before 
 }
 
 func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries fs.DirEntries, err error) {
-	defer log.Trace(f, "dirID=%v", dirID)
 	var (
-		entriesMu sync.Mutex // to protect entries
-		etagsMu   sync.RWMutex
-		wg        sync.WaitGroup
-		checkers  = f.ci.Checkers
-		in        = make(chan api.Item, checkers)
+		etagsMu  sync.RWMutex
+		wg       sync.WaitGroup
+		checkers = f.ci.Checkers
+		in       = make(chan api.Item, checkers)
 	)
 
 	add := func(entry fs.DirEntry) {
@@ -347,20 +366,35 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
+			entriesMu.Lock()
+			dirItem := f.items[dirID]
+			entriesMu.Unlock()
+			if dirItem.firstCreated == 0 {
+				dirItem.firstCreated = math.MaxInt64
+			}
+			if dirItem.lastCreated == 0 {
+				dirItem.lastCreated = math.MinInt64
+			}
+
 			for remote := range in {
-				u, _ := url.Parse(remote.Url)
+				u, _ := url.Parse(remote.URL)
 				base := path.Base(u.Path)
 				if strings.HasPrefix(base, "DASH_1080.mp4") {
 					_, file := path.Split(path.Dir(u.Path))
 					base = file + "_" + base
 				}
 				jsonIn, _ := json.Marshal(&remote)
+				byteArr := json.RawMessage(jsonIn)
 				file := &Object{
-					remote:    path.Join(dirID, strings.Trim(base, "/")),
+					remote:    path.Join(dirID, f.opt.Enc.ToStandardName(base)),
 					fs:        f,
-					id:        remote.Id,
-					remoteUrl: remote.Url,
-					rawData:   json.RawMessage(jsonIn),
+					id:        remote.ID,
+					remoteURL: remote.URL,
+					rawData:   &byteArr,
+				}
+				if len(remote.Preview.Images) > 0 {
+					file.sourceURL = html.UnescapeString(remote.Preview.Images[0].Source.URL)
 				}
 				switch err := file.stat(ctx); err {
 				case nil:
@@ -372,11 +406,44 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 					}
 					if !ok {
 						file.modTime = time.Unix(remote.CreatedUtc, 0)
+
+						dirItem.firstCreated = min(dirItem.firstCreated, remote.CreatedUtc)
+						dirItem.lastCreated = max(dirItem.lastCreated, remote.CreatedUtc)
+
 						add(file)
 						if file.etag != "" {
 							etagsMu.Lock()
 							f.cache[file.etag] = true
 							etagsMu.Unlock()
+						}
+
+						newFile := *file
+
+						addNewFile := func(dir string, m map[string]User, key string) {
+							newFile.remote = path.Join(dir, f.opt.Enc.ToStandardName(base))
+							f.dirCache.FindDir(ctx, dir, true)
+							entriesMu.Lock()
+							u := m[key]
+							if u.firstCreated == 0 {
+								u.firstCreated = math.MaxInt64
+							}
+							if u.lastCreated == 0 {
+								u.lastCreated = math.MinInt64
+							}
+							u.firstCreated = min(u.firstCreated, remote.CreatedUtc)
+							u.lastCreated = max(u.lastCreated, remote.CreatedUtc)
+							var dirEntry fs.DirEntry
+							dirEntry = &newFile
+							u.entries = append(u.entries, dirEntry)
+							m[key] = u
+							entriesMu.Unlock()
+						}
+
+						if strings.HasPrefix(dirID, subredditPrefix) {
+							addNewFile(userPrefix+remote.Author, f.items, userPrefix+remote.Author)
+						}
+						if strings.HasPrefix(dirID, userPrefix) {
+							addNewFile(subredditPrefix+remote.Subreddit, f.items, subredditPrefix+remote.Subreddit)
 						}
 					} else {
 						fs.Debugf(remote, "skipping because etag=%v matches", file.etag)
@@ -385,27 +452,30 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 					fs.Debugf(remote, "skipping because of error: %v", err)
 				}
 			}
+			entriesMu.Lock()
+			f.items[dirID] = dirItem
+			entriesMu.Unlock()
 		}()
 	}
 
 	var created int64
 	for _, e := range data {
-		//fs.Debugf(f, "%+v", e)
 		var (
 			id       string
 			ok       bool
-			thumbUrl string
-		//d  *Dir
+			thumbURL string
 		)
 		if len(e.Preview.Images) > 0 {
+			smallPics := f.opt.SmallPics
 			id = e.Preview.Images[0].ID
-			if len(e.Preview.Images[0].Resolutions) > 0 {
-				smallPics := f.opt.SmallPics
+			if smallPics != -1 && len(e.Preview.Images[0].Resolutions) > 0 {
 				var i int = len(e.Preview.Images[0].Resolutions) - 1
-				if smallPics != -1 && smallPics <= len(e.Preview.Images[0].Resolutions)-1 {
+				if smallPics <= i {
 					i = smallPics
+					thumbURL = html.UnescapeString(e.Preview.Images[0].Resolutions[i].URL)
+				} else {
+					thumbURL = html.UnescapeString(e.Preview.Images[0].Source.URL)
 				}
-				thumbUrl = html.UnescapeString(e.Preview.Images[0].Resolutions[i].Url)
 			}
 			etagsMu.RLock()
 			ok = f.cache[id]
@@ -419,8 +489,8 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 		case "i.redd.it", "i.imgur.com":
 
 			if !ok {
-				if strings.HasSuffix(e.Url, ".gifv") {
-					e.Url = strings.Replace(e.Url, ".gifv", ".mp4", -1)
+				if strings.HasSuffix(e.URL, ".gifv") {
+					e.URL = strings.Replace(e.URL, ".gifv", ".mp4", -1)
 				}
 				etagsMu.Lock()
 				f.cache[id] = true
@@ -428,50 +498,52 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 				if f.opt.SmallPics > -1 {
 					switch e.PostHint {
 					case "image":
-						e.Url = thumbUrl
+						if !strings.HasSuffix(e.URL, ".gif") {
+							e.URL = thumbURL
+						}
 					case "rich:video":
-						fallbackUrl := e.Preview.RedditVideoPreview.FallbackUrl
-						if fallbackUrl != "" {
-							e.Url = html.UnescapeString(fallbackUrl)
+						fallbackURL := e.Preview.RedditVideoPreview.FallbackURL
+						if fallbackURL != "" {
+							e.URL = html.UnescapeString(fallbackURL)
 						}
 					}
 				}
 				in <- e
 			} else {
-				fs.Debugf(f, "skipping %v", e.Url)
+				fs.Debugf(f, "skipping %v", e.URL)
 			}
 
 		case "redgifs.com", "gfycat.com":
-			u, _ := url.Parse(e.Url)
+			u, _ := url.Parse(e.URL)
 			v := path.Base(u.Path)
 			etagsMu.RLock()
 			ok = f.cache[v]
 			etagsMu.RUnlock()
 			if !ok {
 				if f.opt.SmallPics != -1 {
-					fallbackUrl := e.Preview.RedditVideoPreview.FallbackUrl
-					if fallbackUrl != "" {
-						e.Url = html.UnescapeString(fallbackUrl)
+					fallbackURL := e.Preview.RedditVideoPreview.FallbackURL
+					if fallbackURL != "" {
+						e.URL = html.UnescapeString(fallbackURL)
 					} else {
-						fallbackUrl = e.Media.Oembed.ThumbnailUrl
-						if fallbackUrl != "" {
-							if strings.HasSuffix(fallbackUrl, "-mobile.jpg") {
-								fallbackUrl = strings.Replace(fallbackUrl, "-mobile.jpg", ".mp4", -1)
+						fallbackURL = e.Media.Oembed.ThumbnailURL
+						if fallbackURL != "" {
+							if strings.HasSuffix(fallbackURL, "-mobile.jpg") {
+								fallbackURL = strings.Replace(fallbackURL, "-mobile.jpg", ".mp4", -1)
 							}
-							e.Url = fallbackUrl
+							e.URL = fallbackURL
 						} else {
-							e.Url = getGfyCat(f, ctx, v)
+							e.URL = getGfyCat(ctx, f, v)
 						}
 					}
 				} else {
-					e.Url = getGfyCat(f, ctx, v)
+					e.URL = getGfyCat(ctx, f, v)
 				}
 				etagsMu.Lock()
 				f.cache[v] = true
 				etagsMu.Unlock()
 				in <- e
 			} else {
-				fs.Debugf(f, "skipping %v", e.Url)
+				fs.Debugf(f, "skipping %v", e.URL)
 			}
 
 		default:
@@ -485,6 +557,29 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 	return entries, nil
 }
 
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+	switch name {
+	case "refresh":
+		out := make(map[string]string)
+		if user, ok := opt["user"]; ok {
+			entries, _ := f.List(ctx, userPrefix+user)
+			out["len_items"] = strconv.Itoa(len(entries))
+		}
+		return out, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
 // List the objects and directories in dir into entries.  The
 // entries can be returned in any order but should be for a
 // complete directory.
@@ -495,24 +590,23 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) (entries f
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	defer log.Trace(f, "dir=%v", dir)
 	var (
-		data     []api.Item
-		remote   string
-		userItem User
+		data          []api.Item
+		remotePath    string
+		pushshiftItem User
 	)
 
-	/*directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	directoryID, err := f.dirCache.FindDir(ctx, dir, true)
 	if err != nil {
 		return nil, err
-	}*/
+	}
 
-	switch dir {
+	switch directoryID {
 	case "":
-		for _, it := range []string{"r/", "u/"} {
-			remote = path.Join(dir, it)
-			//f.dirCache.Put(remote, it)
-			d := fs.NewDir(remote, time.Now()).SetID(it)
+		for _, it := range []string{subredditPrefix, userPrefix} {
+			remotePath = path.Join(dir, it)
+			f.dirCache.Put(remotePath, it)
+			d := fs.NewDir(remotePath, time.Now()).SetID(it)
 			entries = append(entries, d)
 		}
 		return entries, err
@@ -520,85 +614,112 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	userDir, user := path.Split(dir)
 	if userDir == "" {
-		populateRootTypeDirs := func(user string, items string) (entries fs.DirEntries, err error) {
+		populateRootTypeDirs := func(itemType string, items string) (entries fs.DirEntries, err error) {
 			for _, item := range strings.Split(items, ",") {
+				if !strings.HasPrefix(item, itemType+"/") {
+					item = itemType + "/" + item
+				}
 				//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
 
 				//if directoryID == "" {
-				remote = path.Join(dir, item)
-				f.dirCache.Put(remote, item)
-				d := fs.NewDir(remote, time.Time{}).SetID(item)
+				//remotePath = path.Join(dir, item)
+				f.dirCache.Put(remotePath, item)
+
+				var (
+					el      User
+					ok      bool
+					modtime = time.Time{}
+				)
+
+				switch itemType {
+				case "u":
+					entriesMu.Lock()
+					el, ok = f.items[item]
+					entriesMu.Unlock()
+				case "r":
+					entriesMu.Lock()
+					el, ok = f.items[item]
+					entriesMu.Unlock()
+				}
+				if ok {
+					if el.lastCreated != 0 {
+						modtime = time.Unix(el.lastCreated, 0)
+					}
+				}
+				d := fs.NewDir(item, modtime).SetID(item)
 				entries = append(entries, d)
 				//}
 			}
 			return entries, err
 		}
+
+		makeItems := func(user string, listStr string, m map[string]User) (fs.DirEntries, error) {
+			keys := make([]string, 0, len(m))
+			for k := range m {
+				if strings.HasPrefix(k, user+"/") {
+					keys = append(keys, k)
+				}
+			}
+			keysStr := strings.Join(keys, ",")
+			dirs := listStr
+			if keysStr != "" {
+				dirs = strings.Join([]string{listStr, keysStr}, ",")
+			}
+			return populateRootTypeDirs(user, dirs)
+		}
+
 		switch user {
 		case "u":
-			return populateRootTypeDirs(user, f.opt.Author)
+			return makeItems(user, f.opt.Author, f.items)
 		case "r":
-			return populateRootTypeDirs(user, f.opt.Subreddit)
+			return makeItems(user, f.opt.Subreddit, f.items)
 		}
 	} else {
-		populateDirs := func(m map[string]User, key string, keyType string) (entries fs.DirEntries, err error) {
-			defer log.Trace(f, "key=%v,keyType=%v", key, keyType)
+		populateDirs := func(m map[string]User, pathID string, keyType string) (entries fs.DirEntries, err error) {
 			var (
 				subreddit, author string
 			)
-			switch keyType {
-			case "u/":
-				author = key
-			case "r/":
-				subreddit = key
+			dirID, fileID := path.Split(pathID)
+			switch dirID {
+			case userPrefix:
+				author = fileID
+			case subredditPrefix:
+				subreddit = fileID
 			}
 			//directoryID, _ := f.dirCache.FindDir(ctx, user, false)
-			userItem = m[key]
+			pushshiftItem = m[pathID]
 			//if len(u.entries) == 0 {
-			before := userItem.before
+			before := pushshiftItem.before
 			if before == 0 {
 				before = time.Now().Unix()
-				userItem.before = before
+				pushshiftItem.before = before
 			}
-			after := userItem.after
+			after := pushshiftItem.after
 
-			fetch := func(flag bool) (entries fs.DirEntries, err error) {
-				defer log.Trace(f, "flag=%v", flag)
-				if flag {
-					data, err = f.getPushshift(ctx, subreddit, author, before, 0)
+			fetch := func(isBefore bool) (entries fs.DirEntries, err error) {
+				if isBefore {
+					data, err = f.callPushshift(ctx, subreddit, author, before, 0)
 				} else if after != 0 {
-					data, err = f.getPushshift(ctx, subreddit, author, 0, after)
+					data, err = f.callPushshift(ctx, subreddit, author, 0, after)
 				}
 
 				if err != nil {
-					entries = append(userItem.entries, entries...)
+					entries = append(pushshiftItem.entries, entries...)
 					return entries, fmt.Errorf("couldn't list files: %w", err)
-				}
-
-				min := func(a, b int64) int64 {
-					if a < b {
-						return a
-					}
-					return b
-				}
-				max := func(a, b int64) int64 {
-					if a < b {
-						return b
-					}
-					return a
 				}
 
 				if len(data) > 0 {
 					before = data[len(data)-1].CreatedUtc
 					after = data[0].CreatedUtc
-					userItem.before = min(userItem.before, before)
-					userItem.after = max(userItem.after, after)
+					pushshiftItem.before = min(pushshiftItem.before, before)
+					pushshiftItem.after = max(pushshiftItem.after, after)
 
 					entries, err = f.list(ctx, dir, data)
 				}
 
-				entries = append(userItem.entries, entries...)
-				userItem.entries = entries
-				m[key] = userItem
+				entries = append(pushshiftItem.entries, entries...)
+				pushshiftItem.entries = entries
+				m[pathID] = pushshiftItem
 				return entries, err
 			}
 			entries, err = fetch(true)
@@ -609,20 +730,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			//}
 			return entries, err
 		}
-		switch userDir {
-		case "u/":
-			return populateDirs(f.users, user, userDir)
-		case "r/":
-			return populateDirs(f.subreddits, user, userDir)
-		}
+		return populateDirs(f.items, dir, userDir)
 	}
 
 	return entries, err
-
-	/*if err != nil {
-
-	}*/
-	//f.dirCache.Put(f.remote, f.opt.Subreddit)
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -641,13 +752,30 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	fs.Debugf(f, "FindLeaf(%q, %q)", pathID, leaf)
+	switch pathID {
+	case userPrefix:
+		entriesMu.Lock()
+		_, ok := f.items[pathID+leaf]
+		entriesMu.Unlock()
+		if ok {
+			return userPrefix + leaf, true, nil
+		}
+
+	case subredditPrefix:
+		entriesMu.Lock()
+		_, ok := f.items[pathID+leaf]
+		entriesMu.Unlock()
+		if ok {
+			return subredditPrefix + leaf, true, nil
+		}
+	}
 	return "", false, nil
 }
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
-	return "", errorReadOnly
+	fs.NewDir(pathID+leaf, time.Now()).SetID(leaf)
+	return leaf, nil
 }
 
 // Fs is the filesystem this remote http file object is located within
@@ -707,7 +835,7 @@ func (o *Object) Metadata(ctx context.Context) (m fs.Metadata, err error) {
 		return nil, nil
 	}
 	raw := make(map[string]json.RawMessage)
-	err = json.Unmarshal(o.rawData, &raw)
+	err = json.Unmarshal(*o.rawData, &raw)
 	if err != nil {
 		// fatal: json parsing failed
 		return
@@ -740,7 +868,7 @@ func listOrString(jm json.RawMessage) (rmArray []string, err error) {
 
 // url returns the native url of the object
 func (o *Object) url() string {
-	return o.remoteUrl
+	return o.remoteURL
 }
 
 // parse s into an int64, on failure return def
@@ -889,26 +1017,12 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 
 	fs.Debugf(f, "Checking for changes on remote ")
 	err = f.pacer.CallNoRetry(func() (bool, error) {
-		for author, u := range f.users {
-			go func(author string, u User) {
+		for author, _ := range f.items {
+			go func(author string) {
 				if author != "" {
-					/*data, err := f.getPushshift(ctx, "", author, u.before)
-					if len(data) == 0 {
-						return
-					}
-					before := data[len(data)-1].CreatedUtc
-
-					if err != nil {
-					}
-
-					entries, err := f.list(ctx, "u/"+author, data)
-					entries = append(u.entries, entries...)
-					u.entries = entries
-					u.before = before
-					f.users[author] = u*/
-					notifyFunc("u/"+author, fs.EntryDirectory)
+					notifyFunc(author, fs.EntryDirectory)
 				}
-			}(author, u)
+			}(author)
 		}
 		return false, err
 	})

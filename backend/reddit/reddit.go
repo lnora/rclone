@@ -333,6 +333,7 @@ func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before
 		Method:     "GET",
 		Path:       "/reddit/search/submission",
 		Parameters: values,
+		ExtraHeaders: map[string]string{"Accept-Encoding": "gzip"}
 	}
 
 	err = f.pacer.Call(func() (bool, error) {

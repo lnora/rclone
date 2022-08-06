@@ -330,10 +330,10 @@ func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before
 	}
 
 	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/reddit/search/submission",
-		Parameters: values,
-		ExtraHeaders: map[string]string{"Accept-Encoding": "gzip"}
+		Method:       "GET",
+		Path:         "/reddit/search/submission",
+		Parameters:   values,
+		ExtraHeaders: map[string]string{"Accept-Encoding": "gzip"},
 	}
 
 	err = f.pacer.Call(func() (bool, error) {
@@ -1018,7 +1018,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 
 	fs.Debugf(f, "Checking for changes on remote ")
 	err = f.pacer.CallNoRetry(func() (bool, error) {
-		for author, _ := range f.items {
+		for author := range f.items {
 			go func(author string) {
 				if author != "" {
 					notifyFunc(author, fs.EntryDirectory)

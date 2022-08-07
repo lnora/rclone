@@ -570,7 +570,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		remotePath string
 	)
 
-	directoryID, err := f.dirCache.FindDir(ctx, dir, true)
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
 	}
@@ -579,9 +579,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	case "":
 		for _, it := range []string{subredditPrefix, userPrefix} {
 			remotePath = path.Join(dir, it)
-			f.dirCache.Put(remotePath, remotePath)
-			d := fs.NewDir(remotePath, time.Now()).SetID(it)
-			f.items.AddEntry(d)
+			_, err := f.dirCache.FindDir(ctx, remotePath, false)
+			if err == fs.ErrorDirNotFound {
+				f.dirCache.Put(remotePath, remotePath)
+				d := fs.NewDir(remotePath, time.Now()).SetID(it)
+				f.items.AddEntry(d)
+			} else if err != nil {
+				return nil, err
+			}
 		}
 		return f.items[dir], nil
 	}
@@ -593,20 +598,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				if !strings.HasPrefix(item, itemType+"/") {
 					item = itemType + "/" + item
 				}
-				directoryID, err := f.dirCache.FindDir(ctx, item, true)
+				_, err := f.dirCache.FindDir(ctx, item, false)
 
-				if err != nil {
-
-				}
-
-				if directoryID == "" {
+				if err == fs.ErrorDirNotFound {
 					f.dirCache.Put(item, item)
+					d := fs.NewDir(item, time.Time{}).SetID(item)
+					f.items.AddEntry(d)
 				}
-
-				modtime := time.Time{}
-
-				d := fs.NewDir(item, modtime).SetID(item)
-				f.items.AddEntry(d)
 			}
 			return err
 		}
@@ -660,7 +658,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				before = time.Now().Unix()
 			}
 			if after == math.MinInt64 {
-				before = time.Now().Unix()
+				after = time.Now().Unix()
 			}
 
 			fetch := func(isBefore bool) error {

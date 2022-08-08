@@ -178,6 +178,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		items:      dirtree.New(),
 	}
 	f.features = (&fs.Features{
+		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: false,
 		ReadMetadata:            true,
 		WriteMetadata:           true,
@@ -352,8 +353,8 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 
 	add := func(entry fs.DirEntry) {
 		itemsMu.Lock()
+		defer itemsMu.Unlock()
 		f.items.AddEntry(entry)
-		itemsMu.Unlock()
 	}
 	for i := 0; i < checkers; i++ {
 		wg.Add(1)
@@ -402,9 +403,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 
 						addNewFile := func(dir string) {
 							newFile.remote = path.Join(dir, f.opt.Enc.ToStandardName(base))
-							itemsMu.Lock()
-							f.items.AddEntry(&newFile)
-							itemsMu.Unlock()
+							add(&newFile)
 						}
 
 						if strings.HasPrefix(dirID, subredditPrefix) {
@@ -583,7 +582,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			if err == fs.ErrorDirNotFound {
 				f.dirCache.Put(remotePath, remotePath)
 				d := fs.NewDir(remotePath, time.Now()).SetID(it)
+				itemsMu.Lock()
 				f.items.AddEntry(d)
+				itemsMu.Unlock()
 			} else if err != nil {
 				return nil, err
 			}
@@ -603,7 +604,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				if err == fs.ErrorDirNotFound {
 					f.dirCache.Put(item, item)
 					d := fs.NewDir(item, time.Time{}).SetID(item)
+					itemsMu.Lock()
 					f.items.AddEntry(d)
+					itemsMu.Unlock()
 				}
 			}
 			return err
@@ -661,31 +664,34 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				after = time.Now().Unix()
 			}
 
-			fetch := func(isBefore bool) error {
+			fetch := func(isBefore bool) {
 				if isBefore {
 					data, err = f.callPushshift(ctx, subreddit, author, before, 0)
 				} else if after != 0 {
 					data, err = f.callPushshift(ctx, subreddit, author, 0, after)
 				}
 
-				if err != nil {
-					return fmt.Errorf("couldn't list files: %w", err)
-				}
+				//if err != nil {
+				//	return fmt.Errorf("couldn't list files: %w", err)
+				//}
 
 				if len(data) > 0 {
-					err = f.list(ctx, dir, data)
+					f.list(ctx, dir, data)
 				}
-				return err
+				//return err
 			}
 
-			err = fetch(true)
-			if err != nil {
-				return fmt.Errorf("couldn't list files: %w", err)
+			fetchWithTimeout := func(ctx context.Context) {
+				_, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+				defer cancel()
+				fetch(true)
+				fetch(false)
 			}
-			err = fetch(false)
+			fetchWithTimeout(ctx)
 			return err
 		}
-		err = populateDirs(dir, userDir)
+
+		populateDirs(dir, userDir)
 	}
 
 	return f.items[dir], err
@@ -965,12 +971,10 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 
 	fs.Debugf(f, "Checking for changes on remote ")
 	err = f.pacer.CallNoRetry(func() (bool, error) {
-		for author := range f.items {
-			go func(author string) {
-				if author != "" {
-					notifyFunc(author, fs.EntryDirectory)
-				}
-			}(author)
+		for item := range f.items {
+			go func(key string) {
+				notifyFunc(key, fs.EntryDirectory)
+			}(item)
 		}
 		return false, err
 	})

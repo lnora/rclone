@@ -630,3 +630,5 @@ put them back in again.` >}}
   * Yen Hu <61753151+0x59656e@users.noreply.github.com>
   * Steve Kowalik <steven@wedontsleep.org>
   * Jordi Gonzalez Muñoz <jordigonzm@gmail.com>
+  * Joram Schrijver <i@joram.io>
+  * Mark Trolley <marktrolley@gmail.com>

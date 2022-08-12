@@ -209,7 +209,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// Precision is the remote http file system's modtime precision, which we have no way of knowing. We estimate at 1s
+// Precision of the ModTimes in this Fs
 func (f *Fs) Precision() time.Duration {
 	return time.Second
 }
@@ -389,9 +389,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 						etagsMu.RUnlock()
 					}
 					if !ok {
-						if file.modTime == timeUnset {
-							file.modTime = time.Unix(remote.CreatedUtc, 0)
-						}
+						file.modTime = time.Unix(remote.CreatedUtc, 0)
 						add(file)
 						if file.etag != "" {
 							etagsMu.Lock()
@@ -549,6 +547,11 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			out["len_items"] = strconv.Itoa(len(entries))
 		}
 		return out, nil
+	case "pushshift":
+		if size, ok := opt["size"]; ok {
+			f.opt.PsSize, err = strconv.Atoi(size)
+		}
+		return nil, err
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -564,6 +567,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	defer fs.Debugf(f, "List(%v)", dir)
 	var (
 		data       []api.Item
 		remotePath string
@@ -664,7 +668,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				after = time.Now().Unix()
 			}
 
-			fetch := func(isBefore bool) {
+			fetch := func(isBefore bool) (err error) {
 				if isBefore {
 					data, err = f.callPushshift(ctx, subreddit, author, before, 0)
 				} else if after != 0 {
@@ -676,22 +680,26 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				//}
 
 				if len(data) > 0 {
-					f.list(ctx, dir, data)
+					err = f.list(ctx, dir, data)
 				}
-				//return err
+				return err
 			}
 
-			fetchWithTimeout := func(ctx context.Context) {
+			fetchWithTimeout := func(ctx context.Context) (err error) {
 				_, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 				defer cancel()
-				fetch(true)
-				fetch(false)
+				err = fetch(true)
+				if err != nil {
+					return err
+				}
+				err = fetch(false)
+				return err
 			}
-			fetchWithTimeout(ctx)
+			err = fetchWithTimeout(ctx)
 			return err
 		}
 
-		populateDirs(dir, userDir)
+		err = populateDirs(dir, userDir)
 	}
 
 	return f.items[dir], err
@@ -803,6 +811,11 @@ func (o *Object) Metadata(ctx context.Context) (m fs.Metadata, err error) {
 		m.Set(k, items[0])
 	}
 	return
+}
+
+// ID returns the ID of the Object if known, or "" if not
+func (o *Object) ID() string {
+	return o.id
 }
 
 func listOrString(jm json.RawMessage) (rmArray []string, err error) {
@@ -971,7 +984,12 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 
 	fs.Debugf(f, "Checking for changes on remote ")
 	err = f.pacer.CallNoRetry(func() (bool, error) {
-		for item := range f.items {
+		for _, item := range strings.Split(f.opt.Author, ",") {
+			go func(key string) {
+				notifyFunc(key, fs.EntryDirectory)
+			}(item)
+		}
+		for _, item := range strings.Split(f.opt.Subreddit, ",") {
 			go func(key string) {
 				notifyFunc(key, fs.EntryDirectory)
 			}(item)

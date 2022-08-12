@@ -43,7 +43,7 @@ const (
 var (
 	errorReadOnly = errors.New("reddit remotes are read only")
 	timeUnset     = time.Unix(0, 0)
-	itemsMu       sync.RWMutex
+	itemsMu       sync.Mutex
 )
 
 func min(a, b int64) int64 {
@@ -65,9 +65,10 @@ func init() {
 		Name:        "reddit",
 		NewFs:       NewFs,
 		CommandHelp: commandHelp,
-		Options: []fs.Option{{
-			Name: "author",
-		},
+		Options: []fs.Option{
+			{
+				Name: "author",
+			},
 			{
 				Name: "subreddit",
 			}, {
@@ -83,6 +84,11 @@ func init() {
 			{
 				Name:     "small_pics",
 				Default:  -1,
+				Advanced: true,
+			},
+			{
+				Name:     "mkdirs",
+				Default:  false,
 				Advanced: true,
 			}},
 
@@ -106,6 +112,7 @@ type Options struct {
 	Checkpoint string               `config:"checkpoint"`
 	PsSize     int                  `config:"ps_size"`
 	SmallPics  int                  `config:"small_pics"`
+	Mkdirs     bool                 `config:"mkdirs"`
 	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -345,7 +352,7 @@ func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before
 
 func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 	var (
-		etagsMu  sync.RWMutex
+		etagsMu  sync.Mutex
 		wg       sync.WaitGroup
 		checkers = f.ci.Checkers
 		in       = make(chan api.Item, checkers)
@@ -384,9 +391,9 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 				case nil:
 					ok := false
 					if file.etag != "" {
-						etagsMu.RLock()
+						etagsMu.Lock()
 						ok = f.cache[file.etag]
-						etagsMu.RUnlock()
+						etagsMu.Unlock()
 					}
 					if !ok {
 						file.modTime = time.Unix(remote.CreatedUtc, 0)
@@ -404,11 +411,13 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 							add(&newFile)
 						}
 
-						if strings.HasPrefix(dirID, subredditPrefix) {
-							addNewFile(userPrefix + remote.Author)
-						}
-						if strings.HasPrefix(dirID, userPrefix) {
-							addNewFile(subredditPrefix + remote.Subreddit)
+						if f.opt.Mkdirs {
+							if strings.HasPrefix(dirID, subredditPrefix) {
+								addNewFile(userPrefix + remote.Author)
+							}
+							if strings.HasPrefix(dirID, userPrefix) {
+								addNewFile(subredditPrefix + remote.Subreddit)
+							}
 						}
 					} else {
 						fs.Debugf(remote, "skipping because etag=%v matches", file.etag)
@@ -442,9 +451,9 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 					thumbURL = html.UnescapeString(e.Preview.Images[0].Source.URL)
 				}
 			}
-			etagsMu.RLock()
+			etagsMu.Lock()
 			ok = f.cache[id]
-			etagsMu.RUnlock()
+			etagsMu.Unlock()
 		}
 		if created < e.CreatedUtc {
 			created = e.CreatedUtc
@@ -481,9 +490,9 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 		case "redgifs.com", "gfycat.com":
 			u, _ := url.Parse(e.URL)
 			v := path.Base(u.Path)
-			etagsMu.RLock()
+			etagsMu.Lock()
 			ok = f.cache[v]
-			etagsMu.RUnlock()
+			etagsMu.Unlock()
 			if !ok {
 				if f.opt.SmallPics != -1 {
 					fallbackURL := e.Preview.RedditVideoPreview.FallbackURL
@@ -540,6 +549,20 @@ var commandHelp = []fs.CommandHelp{
 // otherwise it will be JSON encoded and shown to the user like that
 func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
 	switch name {
+	case "dump":
+		out := make(map[string]string)
+		if filePath, ok := opt["filePath"]; ok {
+			itemsMu.Lock()
+			_, entry := f.items.Find(filePath)
+			itemsMu.Unlock()
+			if entry != nil {
+				o := entry.(*Object)
+				mapStructure := &map[string]string{}
+				_ = json.Unmarshal(*o.rawData, mapStructure)
+				out = *mapStructure
+			}
+		}
+		return out, nil
 	case "refresh":
 		out := make(map[string]string)
 		if user, ok := opt["user"]; ok {
@@ -617,7 +640,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 
 		makeItems := func(user string, listStr string) error {
+			itemsMu.Lock()
 			keys := make([]string, 0, len(f.items))
+			itemsMu.Unlock()
 			for k := range f.items {
 				if strings.HasPrefix(k, user+"/") {
 					keys = append(keys, k)
@@ -702,7 +727,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		err = populateDirs(dir, userDir)
 	}
 
-	return f.items[dir], err
+	itemsMu.Lock()
+	dirTree := f.items[dir]
+	itemsMu.Unlock()
+	return dirTree, err
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -725,9 +753,9 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 		return pathID + leaf, true, nil
 	}
 
-	itemsMu.RLock()
+	itemsMu.Lock()
 	_, ok := f.items[pathID+"/"+leaf]
-	itemsMu.RUnlock()
+	itemsMu.Unlock()
 	if ok {
 		return pathID + "/" + leaf, true, nil
 	}
@@ -921,7 +949,16 @@ func (f *Fs) Hashes() hash.Set {
 
 // Mkdir makes the root directory of the Fs object
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	_, err := f.dirCache.FindDir(ctx, dir, false)
+	if err == fs.ErrorDirNotFound {
+		f.dirCache.Put(dir, dir)
+		d := fs.NewDir(dir, time.Time{}).SetID(dir)
+		itemsMu.Lock()
+		f.items.AddEntry(d)
+		itemsMu.Unlock()
+		err = nil
+	}
+	return err
 }
 
 // Remove a remote http file object
@@ -931,7 +968,16 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Rmdir removes the root directory of the Fs object
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	_, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+
+	itemsMu.Lock()
+	err = f.items.Prune(map[string]bool{dir: true})
+	f.dirCache.FlushDir(dir)
+	itemsMu.Unlock()
+	return err
 }
 
 // Update in to the object with the modTime given of the given size

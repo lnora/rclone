@@ -41,9 +41,11 @@ const (
 )
 
 var (
-	errorReadOnly = errors.New("reddit remotes are read only")
-	timeUnset     = time.Unix(0, 0)
-	itemsMu       sync.Mutex
+	errorReadOnly  = errors.New("reddit remotes are read only")
+	errorMinBefore = errors.New("minBefore")
+	timeUnset      = time.Unix(0, 0)
+	itemsMu        sync.Mutex
+	etagsMu        sync.Mutex
 )
 
 func min(a, b int64) int64 {
@@ -116,6 +118,11 @@ type Options struct {
 	Enc        encoder.MultiEncoder `config:"encoding"`
 }
 
+type PushshiftQuery struct {
+	currentBefore int64
+	minBefore     int64
+}
+
 // Fs stores the interface to the remote HTTP files
 type Fs struct {
 	name     string
@@ -131,7 +138,8 @@ type Fs struct {
 	httpClient *http.Client
 	dirCache   *dircache.DirCache // Map of directory path to directory id
 	//usersData  map[string]fs.DirEntries
-	items dirtree.DirTree
+	dirTree   dirtree.DirTree
+	psQueries map[string]PushshiftQuery
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -182,7 +190,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		srv:        rest.NewClient(client).SetRoot(rootURL),
 		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		cache:      map[string]bool{},
-		items:      dirtree.New(),
+		dirTree:    dirtree.New(),
+		psQueries:  map[string]PushshiftQuery{},
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
@@ -307,6 +316,121 @@ func getGfyCat(ctx context.Context, f *Fs, name string) (u string) {
 	return gfycat.Gif.Urls.Sd
 }
 
+func refreshDir(ctx context.Context, f *Fs, pathID string) error {
+	var (
+		subreddit, author string
+		before, after     int64
+	)
+	dirID, fileID := path.Split(pathID)
+	switch dirID {
+	case userPrefix:
+		author = fileID
+	case subredditPrefix:
+		subreddit = fileID
+	}
+
+	itemsMu.Lock()
+	psBefore, psBeforeOk := f.psQueries[pathID]
+	itemsMu.Unlock()
+	if psBeforeOk {
+		before = psBefore.currentBefore
+
+		if before != 0 && before <= psBefore.minBefore {
+			return errorMinBefore
+		}
+	} else {
+		psBefore = PushshiftQuery{}
+		createdUtc, err := f.psGetRange(ctx, subreddit, author)
+
+		if err == nil {
+			psBefore.minBefore = createdUtc
+			itemsMu.Lock()
+			f.psQueries[pathID] = psBefore
+			itemsMu.Unlock()
+		}
+
+		before = math.MaxInt64
+		after = math.MinInt64
+		itemsMu.Lock()
+		f.dirTree[pathID].ForObject(func(obj fs.Object) {
+			o, ok := obj.(*Object)
+			if !ok {
+				log.Trace(o, "internal error: not a reddit object")
+			}
+			createdUtc := o.modTime.Unix()
+			before = min(before, createdUtc)
+			after = max(after, createdUtc)
+		})
+		itemsMu.Unlock()
+		if before == math.MaxInt64 {
+			before = time.Now().Unix()
+		}
+		if after == math.MinInt64 {
+			after = time.Now().Unix()
+		}
+	}
+
+	fetch := func(isBefore bool) (err error) {
+		var data []api.Item
+		if isBefore {
+			data, err = f.callPushshift(ctx, subreddit, author, before, 0)
+		} else if after != 0 {
+			data, err = f.callPushshift(ctx, subreddit, author, 0, after)
+		}
+
+		if len(data) > 0 {
+			err = f.list(ctx, pathID, data)
+		}
+		return err
+	}
+
+	err := fetch(true)
+	if err != nil {
+		return err
+	}
+	err = fetch(false)
+
+	return err
+}
+
+func (f *Fs) psGetRange(ctx context.Context, subreddit, author string) (createdUtc int64, err error) {
+	var (
+		data *api.ListItems
+		resp *http.Response
+	)
+
+	values := url.Values{}
+	if subreddit != "" {
+		values.Set("subreddit", subreddit)
+	}
+	if author != "" {
+		values.Set("author", author)
+	}
+	values.Set("size", "1")
+	values.Set("sort", "asc")
+	values.Set("fields", "created_utc")
+
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/reddit/search/submission",
+		Parameters: values,
+	}
+
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &data)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		fmt.Printf("...Error %v\n", err)
+		return 0, err
+	}
+
+	if len(data.Data) > 0 {
+		return data.Data[0].CreatedUtc, err
+	}
+	return 0, err
+}
+
 func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before int64, after int64) (items []api.Item, err error) {
 	defer log.Trace(f, "subreddit=%v,author=%v,before=%v,after=%v", subreddit, author, before, after)
 	var (
@@ -344,15 +468,12 @@ func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before
 		fmt.Printf("...Error %v\n", err)
 		return nil, err
 	}
-	/*if len(data.Data) == 0 {
-		err = errors.New("no data")
-	}*/
+
 	return data.Data, err
 }
 
 func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 	var (
-		etagsMu  sync.Mutex
 		wg       sync.WaitGroup
 		checkers = f.ci.Checkers
 		in       = make(chan api.Item, checkers)
@@ -361,7 +482,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 	add := func(entry fs.DirEntry) {
 		itemsMu.Lock()
 		defer itemsMu.Unlock()
-		f.items.AddEntry(entry)
+		f.dirTree.AddEntry(entry)
 	}
 	for i := 0; i < checkers; i++ {
 		wg.Add(1)
@@ -439,6 +560,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 			ok       bool
 			thumbURL string
 		)
+
 		if len(e.Preview.Images) > 0 {
 			smallPics := f.opt.SmallPics
 			id = e.Preview.Images[0].ID
@@ -455,7 +577,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 			ok = f.cache[id]
 			etagsMu.Unlock()
 		}
-		if created < e.CreatedUtc {
+		if created == 0 || created > e.CreatedUtc {
 			created = e.CreatedUtc
 		}
 
@@ -524,6 +646,16 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 			fs.Debugf(f, "ignoring %+v", e)
 		}
 	}
+	itemsMu.Lock()
+	psQ, ok := f.psQueries[dirID]
+	itemsMu.Unlock()
+	if !ok {
+		psQ = PushshiftQuery{}
+	}
+	psQ.currentBefore = created
+	itemsMu.Lock()
+	f.psQueries[dirID] = psQ
+	itemsMu.Unlock()
 	//f.dirCache.Put(f.opt.Subreddit, f.opt.Subreddit)
 	//d = fs.NewDir(f.opt.Subreddit, time.Unix(created, 0))
 	close(in)
@@ -553,7 +685,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		out := make(map[string]string)
 		if filePath, ok := opt["filePath"]; ok {
 			itemsMu.Lock()
-			_, entry := f.items.Find(filePath)
+			_, entry := f.dirTree.Find(filePath)
 			itemsMu.Unlock()
 			if entry != nil {
 				o := entry.(*Object)
@@ -592,7 +724,6 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	defer fs.Debugf(f, "List(%v)", dir)
 	var (
-		data       []api.Item
 		remotePath string
 	)
 
@@ -610,13 +741,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				f.dirCache.Put(remotePath, remotePath)
 				d := fs.NewDir(remotePath, time.Now()).SetID(it)
 				itemsMu.Lock()
-				f.items.AddEntry(d)
+				f.dirTree.AddEntry(d)
 				itemsMu.Unlock()
 			} else if err != nil {
 				return nil, err
 			}
 		}
-		return f.items[dir], nil
+		return f.dirTree[dir], nil
 	}
 
 	userDir, user := path.Split(dir)
@@ -632,7 +763,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 					f.dirCache.Put(item, item)
 					d := fs.NewDir(item, time.Time{}).SetID(item)
 					itemsMu.Lock()
-					f.items.AddEntry(d)
+					f.dirTree.AddEntry(d)
 					itemsMu.Unlock()
 				}
 			}
@@ -641,9 +772,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 		makeItems := func(user string, listStr string) error {
 			itemsMu.Lock()
-			keys := make([]string, 0, len(f.items))
+			keys := make([]string, 0, len(f.dirTree))
 			itemsMu.Unlock()
-			for k := range f.items {
+			for k := range f.dirTree {
 				if strings.HasPrefix(k, user+"/") {
 					keys = append(keys, k)
 				}
@@ -663,73 +794,28 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			err = makeItems(user, f.opt.Subreddit)
 		}
 	} else {
-		populateDirs := func(pathID string, keyType string) error {
-			var (
-				subreddit, author string
-				before, after     int64
-			)
-			dirID, fileID := path.Split(pathID)
-			switch dirID {
-			case userPrefix:
-				author = fileID
-			case subredditPrefix:
-				subreddit = fileID
-			}
-			before = math.MaxInt64
-			after = math.MinInt64
-			f.items[pathID].ForObject(func(obj fs.Object) {
-				o, ok := obj.(*Object)
-				if !ok {
-					log.Trace(o, "internal error: not a reddit object")
-				}
-				createdUtc := o.modTime.Unix()
-				before = min(before, createdUtc)
-				after = max(after, createdUtc)
-			})
-			if before == math.MaxInt64 {
-				before = time.Now().Unix()
-			}
-			if after == math.MinInt64 {
-				after = time.Now().Unix()
-			}
-
-			fetch := func(isBefore bool) (err error) {
-				if isBefore {
-					data, err = f.callPushshift(ctx, subreddit, author, before, 0)
-				} else if after != 0 {
-					data, err = f.callPushshift(ctx, subreddit, author, 0, after)
-				}
-
-				//if err != nil {
-				//	return fmt.Errorf("couldn't list files: %w", err)
-				//}
-
-				if len(data) > 0 {
-					err = f.list(ctx, dir, data)
-				}
-				return err
-			}
-
-			fetchWithTimeout := func(ctx context.Context) (err error) {
-				_, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-				defer cancel()
-				err = fetch(true)
-				if err != nil {
-					return err
-				}
-				err = fetch(false)
-				return err
-			}
-			err = fetchWithTimeout(ctx)
-			return err
+		itemsMu.Lock()
+		dirTreeLen := f.dirTree[dir].Len()
+		itemsMu.Unlock()
+		if dirTreeLen == 0 {
+			err = refreshDir(ctx, f, dir)
 		}
-
-		err = populateDirs(dir, userDir)
 	}
 
 	itemsMu.Lock()
-	dirTree := f.items[dir]
+	dirTree := f.dirTree[dir]
+	_, entry := f.dirTree.Find(dir)
+
+	switch entry.(type) {
+	case fs.Directory:
+		d := entry.(*fs.Dir)
+		d.SetItems(int64(dirTree.Len()))
+	}
+
 	itemsMu.Unlock()
+	if err == errorMinBefore {
+		err = nil
+	}
 	return dirTree, err
 }
 
@@ -754,7 +840,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 	}
 
 	itemsMu.Lock()
-	_, ok := f.items[pathID+"/"+leaf]
+	_, ok := f.dirTree[pathID+"/"+leaf]
 	itemsMu.Unlock()
 	if ok {
 		return pathID + "/" + leaf, true, nil
@@ -766,6 +852,12 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	//fs.NewDir(pathID+leaf, time.Now()).SetID(leaf)
 	return pathID + "/" + leaf, nil
+}
+
+// DirCacheFlush resets the directory cache - used in testing as an
+// optional interface
+func (f *Fs) DirCacheFlush() {
+	f.dirCache.ResetRoot()
 }
 
 // Fs is the filesystem this remote http file object is located within
@@ -954,7 +1046,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		f.dirCache.Put(dir, dir)
 		d := fs.NewDir(dir, time.Time{}).SetID(dir)
 		itemsMu.Lock()
-		f.items.AddEntry(d)
+		f.dirTree.AddEntry(d)
 		itemsMu.Unlock()
 		err = nil
 	}
@@ -974,7 +1066,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	itemsMu.Lock()
-	err = f.items.Prune(map[string]bool{dir: true})
+	err = f.dirTree.Prune(map[string]bool{dir: true})
 	f.dirCache.FlushDir(dir)
 	itemsMu.Unlock()
 	return err
@@ -1026,10 +1118,43 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 }
 
 func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType)) {
-	var err error
+	var (
+		wg       sync.WaitGroup
+		checkers = f.ci.Checkers
+	)
+	in := make(chan string, checkers)
 
 	fs.Debugf(f, "Checking for changes on remote ")
-	err = f.pacer.CallNoRetry(func() (bool, error) {
+
+	for i := 0; i < checkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for dir := range in {
+				err := refreshDir(ctx, f, dir)
+				if err == nil {
+					notifyFunc(dir, fs.EntryDirectory)
+				}
+			}
+		}()
+	}
+
+	itemsMu.Lock()
+	dirs := f.dirTree.Dirs()
+	itemsMu.Unlock()
+	for _, dir := range dirs {
+		itemsMu.Lock()
+		parentPath, _ := f.dirTree.Find(dir)
+		itemsMu.Unlock()
+		if parentPath == "u" || parentPath == "r" {
+			in <- dir
+		}
+	}
+	close(in)
+	wg.Wait()
+
+	/*err = f.pacer.CallNoRetry(func() (bool, error) {
 		for _, item := range strings.Split(f.opt.Author, ",") {
 			go func(key string) {
 				notifyFunc(key, fs.EntryDirectory)
@@ -1041,7 +1166,7 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 			}(item)
 		}
 		return false, err
-	})
+	})*/
 }
 
 // Check the interfaces are satisfied

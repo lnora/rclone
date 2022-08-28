@@ -438,6 +438,10 @@ func (f *Fs) callPushshift(ctx context.Context, subreddit, author string, before
 		resp *http.Response
 	)
 
+	if author == "" && subreddit == "" {
+		return nil, nil
+	}
+
 	values := url.Values{}
 	if subreddit != "" {
 		values.Set("subreddit", subreddit)
@@ -609,7 +613,7 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 				fs.Debugf(f, "skipping %v", e.URL)
 			}
 
-		case "redgifs.com", "gfycat.com":
+		case "redgifs.com", "i.redgifs.com", "gfycat.com":
 			u, _ := url.Parse(e.URL)
 			v := path.Base(u.Path)
 			etagsMu.Lock()
@@ -640,6 +644,30 @@ func (f *Fs) list(ctx context.Context, dirID string, data []api.Item) error {
 				in <- e
 			} else {
 				fs.Debugf(f, "skipping %v", e.URL)
+			}
+
+		case "reddit.com":
+			if e.IsGallery {
+				for _, j := range e.MediaMetadata {
+					if j.Status != "valid" {
+						continue
+					}
+					galleryItem := api.Item{}
+					galleryItem.Author = e.Author
+					galleryItem.CreatedUtc = e.CreatedUtc
+					galleryItem.Domain = e.Domain
+					galleryItem.ID = e.ID
+					galleryItem.Subreddit = e.Subreddit
+					var ext string
+					switch j.M {
+					case "image/jpg":
+						ext = ".jpg"
+					case "image/png":
+						ext = ".png"
+					}
+					galleryItem.URL = "https://i.redd.it/" + j.ID + ext
+					in <- galleryItem
+				}
 			}
 
 		default:
